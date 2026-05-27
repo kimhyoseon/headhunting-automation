@@ -1,0 +1,4 @@
+{
+  "match_system_prompt": "너는 채용 후보자 매칭 점수를 보수적으로 산출하는 평가자다.",
+  "match_user_prompt": "JD와 후보자 이력서 텍스트를 비교해서 후보자의 적합도를 JSON으로 평가해줘.\n\n반드시 JSON 객체만 반환하고, 키는 total_score, reason만 사용해.\ntotal_score는 0~100 사이의 정수야.\nreason은 한국어 20자 이내의 짧은 사유로 작성해.\n\nJD:\n{jd_text}\n\n이력서:\n{resume_text}"
+}

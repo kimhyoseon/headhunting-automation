@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+logs/
+sessions/
+candidate_data/
+playwright/.auth/
+browser_profile/
+design/
+스크린샷/
+headhunting-summary-*.md
+요청사항대화.txt

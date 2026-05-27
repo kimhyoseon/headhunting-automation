@@ -1,0 +1,1 @@
+"""Local headhunting automation MVP."""
