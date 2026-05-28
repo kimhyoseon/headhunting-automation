@@ -44,6 +44,13 @@ class Candidate(BaseModel):
     location: str
     skills: list[str]
     resume_text: str
+    remember_page_number: int | None = None
+    remember_page_url: str | None = None
+    remember_detail_url: str | None = None
+    remember_profile_id: str | None = None
+    remember_profile_card_id: str | None = None
+    remember_card_index: int | None = None
+    remember_card_text: str | None = None
 
 
 class ItemScore(BaseModel):
@@ -90,6 +97,7 @@ class RunStatus(str, Enum):
 
 class RunStats(BaseModel):
     total: int = 0
+    crawled: int = 0
     processed: int = 0
     passed: int = 0
     sent: int = 0
@@ -106,6 +114,7 @@ class RunState(BaseModel):
     run_id: str
     status: RunStatus
     config: RunCreateRequest
+    stage: str = "queued"
     stats: RunStats = Field(default_factory=RunStats)
     current_candidate: Candidate | None = None
     results: list[CandidateResult] = Field(default_factory=list)

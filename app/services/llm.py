@@ -75,6 +75,32 @@ class LLMService:
         }
         try:
             response = await self.client.chat.completions.create(**request, timeout=30)
+        except Exception as exc:
+            if self._is_temperature_unsupported(exc) and "temperature" in request:
+                retry_request = {key: value for key, value in request.items() if key != "temperature"}
+                try:
+                    response = await self.client.chat.completions.create(**retry_request, timeout=30)
+                    request = retry_request
+                except Exception as retry_exc:
+                    self._write_debug_log(
+                        enabled=debug_log,
+                        call_type="match",
+                        request=retry_request,
+                        error=f"{repr(exc)}; retry_without_temperature={repr(retry_exc)}",
+                        metadata={"run_id": run_id, "candidate_id": candidate_id, "threshold": threshold},
+                    )
+                    return self._fallback_match(jd_text, resume_text, threshold, "fallback")
+            else:
+                self._write_debug_log(
+                    enabled=debug_log,
+                    call_type="match",
+                    request=request,
+                    error=repr(exc),
+                    metadata={"run_id": run_id, "candidate_id": candidate_id, "threshold": threshold},
+                )
+                return self._fallback_match(jd_text, resume_text, threshold, "fallback")
+
+        try:
             raw = response.choices[0].message.content or "{}"
             data = json.loads(raw)
             total = self._score_value(data)
@@ -105,6 +131,11 @@ class LLMService:
                 metadata={"run_id": run_id, "candidate_id": candidate_id, "threshold": threshold},
             )
             return self._fallback_match(jd_text, resume_text, threshold, "fallback")
+
+    @staticmethod
+    def _is_temperature_unsupported(exc: Exception) -> bool:
+        text = repr(exc).lower()
+        return "temperature" in text and ("unsupported" in text or "default" in text)
 
     def _fallback_match(
         self,

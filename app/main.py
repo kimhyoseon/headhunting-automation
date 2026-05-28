@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.models import AppSettingsUpdate, RunCreateRequest, SendSelectedRequest
 from app.services.llm import LLMService
+from app.services.privacy import redact_candidate_name
 from app.services.remember import MockRememberAdapter
 from app.services.remember_browser import BrowserRememberAdapter, RememberBrowserConfig
 from app.services.runner import RunManager
@@ -35,6 +36,15 @@ llm.configure(
 )
 remember = MockRememberAdapter()
 run_manager = RunManager(llm, remember)
+
+
+@app.middleware("http")
+async def prevent_stale_frontend_assets(request, call_next):
+    response = await call_next(request)
+    if request.url.path in {"/", "/static/app.js"}:
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -68,12 +78,19 @@ async def save_settings(request: AppSettingsUpdate):
 async def create_run(request: RunCreateRequest):
     if not request.jd_text.strip():
         raise HTTPException(status_code=400, detail="JD 본문을 입력하세요.")
-    if os.getenv("CRAWLER_MODE", "mock").strip().lower() == "browser":
-        raise HTTPException(
-            status_code=501,
-            detail="사용자 브라우저 연결 모드는 구조만 준비되어 있습니다. 실제 리멤버 DOM 셀렉터 검증 후 Playwright 어댑터를 연결해야 합니다.",
+    settings = settings_store.load()
+    remember_adapter = None
+    if settings.crawler_mode == "browser":
+        remember_adapter = BrowserRememberAdapter(
+            RememberBrowserConfig(
+                cdp_url=settings.remember_cdp_url,
+                remember_url=settings.remember_url,
+                locale=settings.browser_locale,
+                accept_language=settings.browser_accept_language,
+                timezone=settings.browser_timezone,
+            )
         )
-    return run_manager.create_run(request)
+    return run_manager.create_run(request, remember_adapter=remember_adapter)
 
 
 @app.post("/api/remember/html-test")
@@ -266,6 +283,9 @@ def _build_run_summary(state) -> str:
                 "| 항목 | 내용 |",
                 "| --- | --- |",
                 f"| 후보자 ID | {_md_cell(candidate.id)} |",
+                f"| 리멤버 페이지 | {_md_cell(getattr(candidate, 'remember_page_number', None) or '-')} |",
+                f"| 리멤버 카드 ID | {_md_cell(getattr(candidate, 'remember_profile_card_id', None) or '-')} |",
+                f"| 리멤버 카드 순번 | {_md_cell(getattr(candidate, 'remember_card_index', None) if getattr(candidate, 'remember_card_index', None) is not None else '-')} |",
                 f"| 이름 | {_md_cell(candidate.name)} |",
                 f"| 회사 | {_md_cell(candidate.company)} |",
                 f"| 직무 | {_md_cell(candidate.role)} |",
@@ -311,9 +331,9 @@ def _build_run_summary(state) -> str:
         lines.extend(
             [
                 "",
-                "#### 후보자 이력/프로필 원문",
+                "#### API 전송 인재 text",
                 "",
-                _md_block(candidate.resume_text),
+                _md_block(redact_candidate_name(candidate.resume_text, candidate.name)),
             ]
         )
     lines.extend(

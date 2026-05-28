@@ -15,6 +15,7 @@ from app.models import (
     LLMUsage,
 )
 from app.services.llm import LLMService
+from app.services.privacy import redact_candidate_name
 from app.services.remember import MockRememberAdapter
 
 
@@ -22,15 +23,18 @@ class RunManager:
     def __init__(self, llm: LLMService, remember: MockRememberAdapter) -> None:
         self.llm = llm
         self.remember = remember
+        self.remember_adapters: dict[str, object] = {}
         self.runs: dict[str, RunState] = {}
         self.subscribers: dict[str, set[asyncio.Queue[dict]]] = {}
         self.tasks: dict[str, asyncio.Task] = {}
 
-    def create_run(self, config: RunCreateRequest) -> RunState:
+    def create_run(self, config: RunCreateRequest, remember_adapter: object | None = None) -> RunState:
         run_id = f"R-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:5]}"
         state = RunState(run_id=run_id, status=RunStatus.queued, config=config)
+        adapter = remember_adapter or self.remember
+        self.remember_adapters[run_id] = adapter
         self.runs[run_id] = state
-        task = asyncio.create_task(self._run(state))
+        task = asyncio.create_task(self._run(state, adapter))
         self.tasks[run_id] = task
         return state
 
@@ -92,9 +96,13 @@ class RunManager:
                 result.send_status = SendStatus.skipped
                 result.send_reason = "발송 기준 미달"
                 continue
-            ok, reason = await self.remember.send_proposal(result.candidate)
+            remember_adapter = self.remember_adapters.get(run_id, self.remember)
+            ok, reason = await remember_adapter.send_proposal(result.candidate)
             if ok:
-                result.send_status = SendStatus.sent
+                if str(reason or "").startswith("DRY RUN"):
+                    result.send_status = SendStatus.skipped
+                else:
+                    result.send_status = SendStatus.sent
                 result.send_reason = reason
                 consecutive_send_failures = 0
                 self._log(state, f"제안 발송 성공 - {result.candidate.id} ({result.candidate.name})")
@@ -132,16 +140,63 @@ class RunManager:
     def unsubscribe(self, run_id: str, queue: asyncio.Queue[dict]) -> None:
         self.subscribers.get(run_id, set()).discard(queue)
 
-    async def _run(self, state: RunState) -> None:
+    async def _run(self, state: RunState, remember_adapter: object) -> None:
         state.status = RunStatus.running
+        state.stage = "crawling"
         state.started_at = datetime.now().isoformat(timespec="seconds")
-        self._log(state, "더미 리멤버 어댑터로 검색을 시작합니다.")
+        if state.config.max_candidate_count is not None:
+            state.stats.total = state.config.max_candidate_count
+        adapter_name = "브라우저 리멤버 어댑터" if remember_adapter is not self.remember else "더미 리멤버 어댑터"
+        self._log(state, f"{adapter_name}로 검색을 시작합니다.")
         await self._publish_state(state)
 
-        candidates = await self.remember.search(state.config.max_candidate_count)
+        previous_progress_callback = getattr(remember_adapter, "progress_callback", None)
+
+        async def on_crawl_progress(progress: dict) -> None:
+            state.stage = "crawling"
+            requested = progress.get("requestedLimit")
+            collected = int(progress.get("crawledCount") or progress.get("totalCollected") or 0)
+            if requested:
+                state.stats.total = int(requested)
+            elif state.config.max_candidate_count is not None:
+                state.stats.total = state.config.max_candidate_count
+            else:
+                state.stats.total = max(state.stats.total, collected)
+            if state.stats.total:
+                collected = min(collected, state.stats.total)
+            state.stats.crawled = collected
+            await self._publish_state(state)
+
+        if hasattr(remember_adapter, "progress_callback"):
+            remember_adapter.progress_callback = on_crawl_progress
+
+        try:
+            candidates = await remember_adapter.search(state.config.max_candidate_count)
+        except Exception as exc:
+            state.status = RunStatus.failed
+            state.stage = "failed"
+            state.stop_reason = str(exc)
+            state.completed_at = datetime.now().isoformat(timespec="seconds")
+            self._log(state, f"리멤버 검색 실패 - {exc}")
+            await self._publish_state(state)
+            return
+        finally:
+            if hasattr(remember_adapter, "progress_callback"):
+                remember_adapter.progress_callback = previous_progress_callback
         state.stats = RunStats(total=len(candidates))
+        state.stats.crawled = len(candidates)
+        state.stage = "matching"
         process_label = "무제한" if state.config.max_candidate_count is None else f"{state.config.max_candidate_count}명"
         self._log(state, f"검색 결과 {len(candidates)}명을 불러왔습니다. 처리 상한 {process_label}.")
+        crawl_result = getattr(remember_adapter, "last_crawl_result", None)
+        if isinstance(crawl_result, dict):
+            pages = crawl_result.get("pages") or []
+            if pages:
+                page_summary = ", ".join(
+                    f"{page.get('pageNumber')}p {page.get('collected')}명"
+                    for page in pages[:10]
+                )
+                self._log(state, f"리멤버 페이지 수집 내역: {page_summary}")
         await self._publish_state(state)
 
         for index, candidate in enumerate(candidates, start=1):
@@ -154,10 +209,11 @@ class RunManager:
             self._log(state, f"후보자 {index}/{len(candidates)} 상세 페이지 열람 - {candidate.name} ({candidate.company})")
             await self._publish_state(state)
 
-            opened = await self.remember.open_candidate(candidate)
+            opened = await remember_adapter.open_candidate(candidate)
+            api_resume_text = self._candidate_text_for_api(opened)
             match = await self.llm.match_candidate(
                 state.config.jd_text,
-                opened.resume_text,
+                api_resume_text,
                 state.config.threshold,
                 debug_log=state.config.test_mode,
                 run_id=state.run_id,
@@ -180,10 +236,17 @@ class RunManager:
 
         if state.status != RunStatus.cancelled:
             state.status = RunStatus.ready_to_send
+            state.stage = "ready_to_send"
             state.current_candidate = None
             state.stop_reason = "분석 완료 - 발송 대기"
-            self._log(state, "모든 더미 후보자 분석이 완료되었습니다. 발송 단계로 이동합니다.")
+            self._log(state, "모든 후보자 분석이 완료되었습니다. 발송 단계로 이동합니다.")
             await self._publish_state(state)
+
+    def _candidate_text_for_api(self, candidate) -> str:
+        return redact_candidate_name(
+            str(getattr(candidate, "resume_text", "") or ""),
+            str(getattr(candidate, "name", "") or ""),
+        )
 
     def _combine_usage(self, current: LLMUsage, incoming: LLMUsage) -> LLMUsage:
         if not incoming.total_tokens:

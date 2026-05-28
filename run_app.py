@@ -19,9 +19,9 @@ ROOT_DIR = Path(__file__).resolve().parent
 ENV_PATH = ROOT_DIR / ".env"
 ENV_EXAMPLE_PATH = ROOT_DIR / ".env.example"
 REQUIREMENTS_PATH = ROOT_DIR / "requirements.txt"
-DEFAULT_REMEMBER_URL = "https://career.rememberapp.co.kr/"
+DEFAULT_REMEMBER_URL = "https://headhunting-pro.rememberapp.co.kr/"
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
-DEFAULT_BROWSER_PROFILE_DIR = "browser_profile"
+DEFAULT_BROWSER_PROFILE_DIR = "%LOCALAPPDATA%\\headhunting-automation\\browser_profile"
 
 
 def main() -> None:
@@ -172,6 +172,8 @@ def launch_workspace_browser(app_url: str, env: dict[str, str]) -> None:
 
     if cdp_is_available(cdp_url):
         print(f"Using existing controlled browser: {cdp_url}")
+        if create_workspace_windows(cdp_url, app_url, remember_url):
+            return
         if browser_path:
             open_workspace_windows(browser_path, app_url, remember_url, debug_port, profile_dir, env, cdp_url)
         else:
@@ -206,6 +208,13 @@ def open_workspace_windows(
     app_bounds, remember_bounds = workspace_window_bounds()
     print(f"Opening controlled browser on {cdp_url}")
     print(f"Browser profile: {profile_dir}")
+    if not cdp_is_available(cdp_url):
+        launch_browser_window(browser_path, "about:blank", debug_port, profile_dir, env, app_bounds)
+        wait_until_cdp_available(cdp_url, timeout=6)
+
+    if cdp_is_available(cdp_url) and create_workspace_windows(cdp_url, app_url, remember_url):
+        return
+
     launch_browser_window(browser_path, app_url, debug_port, profile_dir, env, app_bounds)
     wait_until_cdp_available(cdp_url, timeout=4)
     launch_browser_window(browser_path, remember_url, debug_port, profile_dir, env, remember_bounds)
@@ -298,6 +307,28 @@ def arrange_workspace_windows(cdp_url: str, app_url: str, remember_url: str) -> 
             browser.close()
 
 
+def create_workspace_windows(cdp_url: str, app_url: str, remember_url: str) -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+
+    app_bounds, remember_bounds = workspace_window_bounds()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(cdp_url)
+            try:
+                session = browser.new_browser_cdp_session()
+                create_cdp_window(session, app_url, app_bounds)
+                create_cdp_window(session, remember_url, remember_bounds)
+                return True
+            finally:
+                browser.close()
+    except Exception as exc:
+        print(f"Could not create browser workspace through CDP: {exc}")
+        return False
+
+
 def find_workspace_page(pages, target_url: str, fallback: str):
     target = normalize_url_for_match(target_url)
     fallback = fallback.lower()
@@ -312,6 +343,48 @@ def find_workspace_page(pages, target_url: str, fallback: str):
 
 def normalize_url_for_match(url: str) -> str:
     return url.rstrip("/").lower()
+
+
+def page_matches_url(page, target_url: str) -> bool:
+    return normalize_url_for_match(page.url).startswith(normalize_url_for_match(target_url))
+
+
+def create_cdp_window(session, target_url: str, bounds: tuple[int, int, int, int]) -> None:
+    left, top, width, height = bounds
+    target = session.send(
+        "Target.createTarget",
+        {
+            "url": target_url,
+            "newWindow": True,
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+        },
+    )
+    window = session.send("Browser.getWindowForTarget", {"targetId": target["targetId"]})
+    session.send(
+        "Browser.setWindowBounds",
+        {
+            "windowId": window["windowId"],
+            "bounds": {
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "windowState": "normal",
+            },
+        },
+    )
+
+
+def get_page_window_id(page) -> int | None:
+    try:
+        session = page.context.new_cdp_session(page)
+        window = session.send("Browser.getWindowForTarget")
+        return int(window["windowId"])
+    except Exception:
+        return None
 
 
 def set_page_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
@@ -348,7 +421,7 @@ def _debug_port(env: dict[str, str], cdp_url: str) -> int:
 
 
 def _profile_dir(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
+    path = Path(os.path.expandvars(raw_path)).expanduser()
     if not path.is_absolute():
         path = ROOT_DIR / path
     return path

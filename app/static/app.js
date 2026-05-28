@@ -27,6 +27,7 @@ const state = {
   sendSort: { key: "score", direction: "desc" },
   sendSelection: {},
   autoSendRunId: null,
+  currentStep: 1,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -250,13 +251,14 @@ async function runCrawlTest() {
   button.textContent = "확인 중...";
   status.textContent = "CDP 브라우저에 연결해서 리멤버 탭 DOM을 확인하는 중입니다.";
   badge.textContent = "실행 중";
-  output.textContent = "";
+  output.textContent = "크롤링 요청 전송 중...\n리멤버 탭에서 현재 화면의 인재 카드 2명을 순서대로 확인합니다.";
 
   try {
     const data = await api("/api/remember/html-test", { method: "POST", body: "{}" });
     badge.textContent = data.found ? "성공" : "탭 없음";
+    const candidateNames = (data.candidates || []).map((candidate) => candidate.name).filter(Boolean).join(", ");
     status.textContent = data.found
-      ? `연결 성공 · ${data.title || "제목 없음"} · HTML ${Number(data.htmlLength || 0).toLocaleString("ko-KR")}자`
+      ? `수집 완료 · ${Number(data.candidateCount || 0).toLocaleString("ko-KR")}명${candidateNames ? ` (${candidateNames})` : ""}`
       : data.message || "브라우저에는 연결했지만 리멤버 탭을 찾지 못했습니다.";
     output.textContent = formatCrawlData(data);
   } catch (error) {
@@ -274,12 +276,17 @@ function formatCrawlData(data) {
     return JSON.stringify(data, null, 2);
   }
   const lines = [
+    `Candidates: ${Number(data.candidateCount || 0).toLocaleString("ko-KR")} / ${Number(data.requestedLimit || 0).toLocaleString("ko-KR")}`,
+    "",
+    "[Candidates]",
+    ...formatCrawlCandidates(data.candidates || []),
+    "",
+    "[Page]",
     `URL: ${data.url || "-"}`,
     `Title: ${data.title || "-"}`,
     `HTML: ${Number(data.htmlLength || 0).toLocaleString("ko-KR")} chars`,
     `Text: ${Number(data.textLength || 0).toLocaleString("ko-KR")} chars`,
     `ScrollY: ${Number(data.scrollY || 0).toLocaleString("ko-KR")}`,
-    `Demo button clicks: ${data.demoClickCount || 0}`,
     "",
     "[Actions]",
     ...(data.demo_actions || []).map((item, index) => `${index + 1}. ${item}`),
@@ -294,6 +301,16 @@ function formatCrawlData(data) {
     JSON.stringify(data.environment || {}, null, 2),
   ];
   return lines.join("\n");
+}
+
+function formatCrawlCandidates(candidates) {
+  if (!candidates.length) {
+    return ["No candidate cards collected."];
+  }
+  return candidates.flatMap((candidate) => [
+    `${candidate.order}. ${candidate.name || "-"} · ${candidate.success ? "OK" : "FAILED"} · ${candidate.detailSource || "-"} · ${Number(candidate.detailLength || 0).toLocaleString("ko-KR")} chars`,
+    `   ${String(candidate.detailText || candidate.reason || "").slice(0, 1000)}`,
+  ]);
 }
 
 async function loadSettings() {
@@ -543,6 +560,8 @@ function downloadRunSummary() {
 }
 
 function showStep(step) {
+  const changed = state.currentStep !== step;
+  state.currentStep = step;
   document.querySelectorAll(".screen").forEach((screen) => screen.classList.remove("active"));
   $(`screen-${step}`).classList.add("active");
   document.querySelectorAll(".step").forEach((button) => {
@@ -550,17 +569,28 @@ function showStep(step) {
     button.classList.toggle("current", n === step);
     button.classList.toggle("done", n < step);
   });
+  if (changed) {
+    requestAnimationFrame(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }));
+  }
 }
 
 function renderRun(run) {
   const stats = run.stats || {};
   const total = stats.total || 0;
   const processed = stats.processed || 0;
-  const pct = total ? Math.round((processed / total) * 100) : 0;
-  $("progress-count").textContent = `${processed} / ${total}`;
+  const crawled = stats.crawled || 0;
+  const stage = run.stage || "";
+  const progressProcessed = stage === "crawling" ? crawled : processed;
+  const progressTotal = total || (stage === "crawling" ? (run.config?.max_candidate_count || crawled) : 0);
+  const pct = progressTotal ? Math.min(100, Math.round((progressProcessed / progressTotal) * 100)) : 0;
+  $("progress-count").textContent = `${progressProcessed} / ${progressTotal}`;
+  const progressLabel = $("progress-count").nextElementSibling;
+  if (progressLabel) {
+    progressLabel.textContent = stage === "crawling" ? " 수집 중" : stage === "matching" ? " 매칭 중" : " 처리 중";
+  }
   $("progress-fill").style.width = `${pct}%`;
   $("stat-total").textContent = total;
-  $("stat-processed").textContent = processed;
+  $("stat-processed").textContent = stage === "crawling" ? crawled : processed;
   $("stat-passed").textContent = stats.passed || 0;
   $("stat-sent").textContent = stats.sent || 0;
   $("stat-failed").textContent = stats.failed || 0;
