@@ -38,7 +38,7 @@ def build_mock_candidates() -> list[Candidate]:
     ]
 
     candidates: list[Candidate] = []
-    for cid, name, company, role, exp, location, skills in raw:
+    for crawl_order, (cid, name, company, role, exp, location, skills) in enumerate(raw, start=1):
         resume = (
             f"{company}에서 {role}로 근무하며 {', '.join(skills[:3])} 중심의 제품 경험을 쌓았습니다. "
             f"경력은 {exp}이며 {location} 근무가 가능합니다. "
@@ -55,6 +55,7 @@ def build_mock_candidates() -> list[Candidate]:
                 location=location,
                 skills=skills,
                 resume_text=resume,
+                crawl_order=crawl_order,
             )
         )
     return candidates

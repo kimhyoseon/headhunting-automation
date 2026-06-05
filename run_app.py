@@ -69,6 +69,8 @@ def ensure_env_file() -> None:
                 "BROWSER_LOCALE=ko-KR",
                 "BROWSER_ACCEPT_LANGUAGE=ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
                 "BROWSER_TIMEZONE=Asia/Seoul",
+                "CONFIRM_BEFORE_PROPOSAL_SEND=false",
+                "REMEMBER_SKIP_PROPOSAL_SEND=true",
             ]
         )
         + "\n",

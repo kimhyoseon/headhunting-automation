@@ -49,6 +49,7 @@ class Candidate(BaseModel):
     remember_detail_url: str | None = None
     remember_profile_id: str | None = None
     remember_profile_card_id: str | None = None
+    crawl_order: int | None = None
     remember_card_index: int | None = None
     remember_card_text: str | None = None
 
@@ -71,6 +72,7 @@ class MatchResult(BaseModel):
 
 class SendStatus(str, Enum):
     pending = "pending"
+    excluded = "excluded"
     skipped = "skipped"
     sent = "sent"
     failed = "failed"
@@ -87,7 +89,6 @@ class CandidateResult(BaseModel):
 class RunStatus(str, Enum):
     queued = "queued"
     running = "running"
-    paused = "paused"
     ready_to_send = "ready_to_send"
     sending = "sending"
     completed = "completed"
@@ -100,8 +101,12 @@ class RunStats(BaseModel):
     crawled: int = 0
     processed: int = 0
     passed: int = 0
+    selected: int = 0
     sent: int = 0
+    excluded: int = 0
+    skipped: int = 0
     failed: int = 0
+    consecutive_failed: int = 0
 
 
 class RunEvent(BaseModel):
@@ -117,6 +122,7 @@ class RunState(BaseModel):
     stage: str = "queued"
     stats: RunStats = Field(default_factory=RunStats)
     current_candidate: Candidate | None = None
+    current_crawl_name: str | None = None
     results: list[CandidateResult] = Field(default_factory=list)
     usage: LLMUsage = Field(default_factory=LLMUsage)
     logs: list[str] = Field(default_factory=list)
@@ -132,6 +138,7 @@ class SendSelectedRequest(BaseModel):
 
 
 class AppSettingsResponse(BaseModel):
+    provider: str = "remember"
     api_key_set: bool
     api_key_preview: str | None = None
     openai_model: str = "gpt-5.4-mini"
@@ -148,6 +155,8 @@ class AppSettingsResponse(BaseModel):
     browser_locale: str = "ko-KR"
     browser_accept_language: str = "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
     browser_timezone: str = "Asia/Seoul"
+    confirm_before_proposal_send: bool = False
+    remember_skip_proposal_send: bool = True
     prompts: PromptSettings = Field(default_factory=PromptSettings)
 
 
@@ -168,4 +177,6 @@ class AppSettingsUpdate(BaseModel):
     browser_locale: str = "ko-KR"
     browser_accept_language: str = "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
     browser_timezone: str = "Asia/Seoul"
+    confirm_before_proposal_send: bool = False
+    remember_skip_proposal_send: bool = True
     prompts: PromptSettings = Field(default_factory=PromptSettings)

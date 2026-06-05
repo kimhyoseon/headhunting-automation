@@ -20,12 +20,17 @@ const sampleJD = `[채용 포지션]
 서울 강남 · 풀타임 · 주 1회 재택 · 경력 5~9년
 연봉 8,500~11,000만원 + 스톡옵션`;
 
+const defaultSendSort = { key: "crawlOrder", direction: "asc" };
+
 const state = {
   run: null,
   socket: null,
   settings: null,
-  sendSort: { key: "score", direction: "desc" },
+  sendSort: { ...defaultSendSort },
   sendSelection: {},
+  saraminOfferPosition: null,
+  saraminOfferPositions: [],
+  saraminOfferStatus: "",
   autoSendRunId: null,
   currentStep: 1,
 };
@@ -39,7 +44,6 @@ const defaultMaxCandidates = 30;
 function init() {
   loadDraft();
   updateJDCount();
-  updateTestModeCopy();
   bindEvents();
   loadSettings();
 }
@@ -54,27 +58,23 @@ function bindEvents() {
     saveDraft();
   });
   bindLimitControl("max-candidates", 1);
-  $("test-mode").addEventListener("change", (event) => {
-    updateTestModeCopy();
-    saveDraft();
-  });
   $("reset-input").addEventListener("click", () => {
     $("jd-text").value = sampleJD;
     $("threshold").value = 90;
     $("threshold-label").textContent = "90";
     setLimitControl("max-candidates", defaultMaxCandidates);
-    $("test-mode").checked = false;
     updateJDCount();
-    updateTestModeCopy();
     saveDraft();
   });
   $("generate-btn").addEventListener("click", startRunFromButton);
-  $("crawl-test-btn").addEventListener("click", runCrawlTest);
-  $("pause-btn").addEventListener("click", pauseRun);
+  $("crawl-test-btn")?.addEventListener("click", runCrawlTest);
+  $("saramin-position-btn")?.addEventListener("click", chooseSaraminOfferPosition);
+  $("saramin-position-options")?.addEventListener("click", handleSaraminOfferPositionClick);
   $("cancel-btn").addEventListener("click", cancelRun);
   $("send-selected-btn").addEventListener("click", sendSelected);
   $("send-threshold").addEventListener("input", updateSendThreshold);
   $("send-threshold").addEventListener("change", updateSendThreshold);
+  $("send-select-all").addEventListener("change", handleSendSelectAllChange);
   $("send-table").addEventListener("click", handleSendTableClick);
   $("send-table").addEventListener("change", handleSendTableChange);
   $("download-summary-btn").addEventListener("click", downloadRunSummary);
@@ -107,7 +107,6 @@ function loadDraft() {
   $("threshold").value = draft.threshold ?? 90;
   $("threshold-label").textContent = $("threshold").value;
   setLimitControl("max-candidates", Object.prototype.hasOwnProperty.call(draft, "max_candidate_count") ? draft.max_candidate_count : defaultMaxCandidates);
-  $("test-mode").checked = Boolean(draft.test_mode);
 }
 
 function readDraft() {
@@ -123,7 +122,6 @@ function saveDraft() {
     jd_text: $("jd-text").value,
     threshold: Number($("threshold").value),
     max_candidate_count: readLimitValue("max-candidates", 1),
-    test_mode: $("test-mode").checked,
   };
   try {
     localStorage.setItem(draftKey, JSON.stringify(payload));
@@ -181,12 +179,6 @@ function readLimitValue(prefix, minValue) {
   return Math.max(minValue, Number($(`${prefix}-range`).value || minValue));
 }
 
-function updateTestModeCopy() {
-  $("test-mode-copy").textContent = $("test-mode").checked
-    ? "ON - 통과자를 모아 선택 발송"
-    : "OFF - 통과자에게 자동 발송 시뮬레이션";
-}
-
 function updateJDCount() {
   $("jd-count").textContent = `${$("jd-text").value.length.toLocaleString()}자`;
 }
@@ -206,8 +198,13 @@ async function api(path, options = {}) {
 async function startRunFromButton() {
   const button = $("generate-btn");
   button.disabled = true;
-  button.textContent = "실행 시작 중...";
+  button.textContent = isSaraminProvider() ? "사람인 검색 확인 중..." : "리멤버 검색수 확인 중...";
   try {
+    if (isSaraminProvider() && !state.saraminOfferPosition) {
+      button.textContent = "사람인 제안 포지션 선택 중...";
+      const selected = await chooseSaraminOfferPosition();
+      if (!selected) return;
+    }
     saveDraft();
     await startRun();
   } catch (error) {
@@ -222,24 +219,156 @@ async function startRun() {
   const payload = {
     jd_text: $("jd-text").value,
     threshold: Number($("threshold").value),
-    test_mode: $("test-mode").checked,
+    test_mode: state.settings?.confirm_before_proposal_send === true,
     max_candidate_count: readLimitValue("max-candidates", 1),
   };
   saveDraft();
   const run = await api("/api/runs", { method: "POST", body: JSON.stringify(payload) });
   state.run = run;
   state.autoSendRunId = null;
+  state.sendSort = { ...defaultSendSort };
   state.sendSelection = {};
   $("send-threshold").value = payload.threshold;
   $("send-threshold-label").textContent = String(payload.threshold);
-  $("mode-pill").textContent = payload.test_mode ? "테스트모드 ON" : "테스트모드 OFF";
+  $("mode-pill").textContent = run.config?.test_mode ? "확인 후 발송 ON" : "확인 후 발송 OFF";
   $("run-meta").textContent = `실행 ID ${run.run_id}`;
   showStep(2);
   connectSocket(run.run_id);
   renderRun(run);
 }
 
+function isSaraminProvider() {
+  return state.settings?.provider === "saramin";
+}
+
+function providerDisplayName() {
+  return isSaraminProvider() ? "사람인" : "리멤버";
+}
+
+function providerRunFileName() {
+  return isSaraminProvider() ? "run_saramin.bat" : "run_app.bat";
+}
+
+function providerDefaultUrl() {
+  return isSaraminProvider()
+    ? "https://www.saramin.co.kr/zf_user/memcom/talent-pool/main/search"
+    : "https://career.rememberapp.co.kr/";
+}
+
+function renderProviderCopy() {
+  const provider = providerDisplayName();
+  const runFile = providerRunFileName();
+  $("provider-session-copy").textContent = `브라우저 ${provider} 세션 연결`;
+  $("provider-page-copy").textContent = `JD와 현재 ${provider} 창의 후보자 정보를 비교해 매칭 분석을 진행합니다.`;
+  $("crawl-test-title").textContent = `${provider} 탭 HTML 테스트`;
+  $("settings-crawler-mode-copy").textContent = `현재는 목 데이터가 기본값입니다. 실제 ${provider} 접근 PC에서 브라우저 연결 모드로 전환합니다.`;
+  $("settings-provider-url-label").textContent = `${provider} 시작 URL`;
+  $("settings-provider-url-copy").textContent = `전용 브라우저를 열 때 앱 탭과 함께 열릴 ${provider} 탭 주소입니다.`;
+  $("settings-provider-language-copy").textContent = `${provider} 탭의 이후 요청에 적용됩니다. 기존 로드 요청에는 적용되지 않습니다.`;
+  $("settings-provider-run-copy").innerHTML = `<code>${runFile}</code>을 실행하면 서버가 켜지고, 같은 Chrome/Edge 창 안에 앱 탭과 ${provider} 탭이 함께 열립니다. 사용자는 ${provider} 탭에서 로그인과 검색 조건 설정을 마친 뒤 앱 탭에서 시작 버튼을 누르는 흐름으로 진행합니다.`;
+  $("settings-remember-url").placeholder = providerDefaultUrl();
+}
+
+function renderSaraminProviderControls() {
+  const card = $("saramin-position-card");
+  if (!card) return;
+  card.hidden = !isSaraminProvider();
+  if (!isSaraminProvider()) return;
+  const position = state.saraminOfferPosition;
+  const badge = $("saramin-position-badge");
+  const label = $("saramin-position-label");
+  const options = $("saramin-position-options");
+  badge.textContent = position ? "선택됨" : "미선택";
+  badge.classList.toggle("selected", Boolean(position));
+  $("saramin-position-status").textContent = state.saraminOfferStatus || (position ? "선택 완료" : "제안 발송에 사용할 포지션을 먼저 선택하세요.");
+  label.textContent = position ? formatSaraminPosition(position) : "선택된 포지션 없음";
+  label.classList.toggle("empty", !position);
+  renderSaraminOfferPositionOptions(options);
+}
+
+async function chooseSaraminOfferPosition() {
+  const button = $("saramin-position-btn");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "포지션 불러오는 중...";
+  }
+  try {
+    state.saraminOfferStatus = "사람인 후보자 상세에서 제안 포지션을 확인 중입니다.";
+    renderSaraminProviderControls();
+    const data = await api("/api/saramin/offer-positions");
+    const positions = data.positions || [];
+    state.saraminOfferPositions = positions;
+    if (!positions.length) {
+      state.saraminOfferStatus = data.reason || "사람인 제안 포지션을 찾지 못했습니다.";
+      renderSaraminProviderControls();
+      return false;
+    }
+    if (positions.length === 1) {
+      return await saveSaraminOfferPosition(positions[0]);
+    }
+    state.saraminOfferStatus = `${positions.length}개 포지션을 찾았습니다. 사용할 포지션을 하나 선택하세요.`;
+    renderSaraminProviderControls();
+    return false;
+  } catch (error) {
+    state.saraminOfferStatus = error.message;
+    renderSaraminProviderControls();
+    return false;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "제안 포지션 선택";
+    }
+  }
+}
+
+function renderSaraminOfferPositionOptions(container) {
+  if (!container) return;
+  if (!state.saraminOfferPositions.length) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+  const selectedId = state.saraminOfferPosition?.id || "";
+  container.hidden = false;
+  container.innerHTML = state.saraminOfferPositions.map((position) => {
+    const selected = selectedId && selectedId === position.id;
+    return `
+      <button class="saramin-option-button${selected ? " selected" : ""}" type="button" data-position-id="${escapeAttr(position.id || "")}">
+        ${escapeHtml(formatSaraminPosition(position))}
+      </button>
+    `;
+  }).join("");
+}
+
+async function handleSaraminOfferPositionClick(event) {
+  const button = event.target.closest(".saramin-option-button");
+  if (!button) return;
+  const position = state.saraminOfferPositions.find((item) => item.id === button.dataset.positionId);
+  if (!position) return;
+  button.disabled = true;
+  const saved = await saveSaraminOfferPosition(position);
+  button.disabled = false;
+  return saved;
+}
+
+async function saveSaraminOfferPosition(position) {
+  const saved = await api("/api/saramin/offer-position", {
+    method: "POST",
+    body: JSON.stringify({ id: position.id || "", label: position.label || "" }),
+  });
+  state.saraminOfferPosition = saved.position || position;
+  state.saraminOfferStatus = "선택 완료";
+  renderSaraminProviderControls();
+  return true;
+}
+
+function formatSaraminPosition(position) {
+  const label = position?.label || position?.id || "-";
+  return position?.id ? `${label} (${position.id})` : label;
+}
+
 async function runCrawlTest() {
+  const provider = providerDisplayName();
   const button = $("crawl-test-btn");
   const panel = $("crawl-test-panel");
   const status = $("crawl-test-status");
@@ -249,9 +378,9 @@ async function runCrawlTest() {
   panel.hidden = false;
   button.disabled = true;
   button.textContent = "확인 중...";
-  status.textContent = "CDP 브라우저에 연결해서 리멤버 탭 DOM을 확인하는 중입니다.";
+  status.textContent = `CDP 브라우저에 연결해서 ${provider} 탭 DOM을 확인하는 중입니다.`;
   badge.textContent = "실행 중";
-  output.textContent = "크롤링 요청 전송 중...\n리멤버 탭에서 현재 화면의 인재 카드 2명을 순서대로 확인합니다.";
+  output.textContent = `크롤링 요청 전송 중...\n${provider} 탭에서 현재 화면의 인재 카드 2명을 순서대로 확인합니다.`;
 
   try {
     const data = await api("/api/remember/html-test", { method: "POST", body: "{}" });
@@ -259,7 +388,7 @@ async function runCrawlTest() {
     const candidateNames = (data.candidates || []).map((candidate) => candidate.name).filter(Boolean).join(", ");
     status.textContent = data.found
       ? `수집 완료 · ${Number(data.candidateCount || 0).toLocaleString("ko-KR")}명${candidateNames ? ` (${candidateNames})` : ""}`
-      : data.message || "브라우저에는 연결했지만 리멤버 탭을 찾지 못했습니다.";
+      : data.message || `브라우저에는 연결했지만 ${provider} 탭을 찾지 못했습니다.`;
     output.textContent = formatCrawlData(data);
   } catch (error) {
     badge.textContent = "실패";
@@ -324,6 +453,7 @@ async function loadSettings() {
 }
 
 function renderSettings(settings) {
+  renderProviderCopy();
   $("settings-api-key").value = "";
   $("settings-key-status").textContent = settings.api_key_set
     ? `저장된 키 있음 (${settings.api_key_preview})`
@@ -335,18 +465,21 @@ function renderSettings(settings) {
   $("settings-max-delay").value = settings.max_delay_seconds;
   $("settings-usd-krw-rate").value = settings.usd_krw_rate;
   $("settings-crawler-mode").value = settings.crawler_mode || "mock";
-  $("settings-remember-url").value = settings.remember_url || "https://career.rememberapp.co.kr/";
+  $("settings-remember-url").value = settings.remember_url || providerDefaultUrl();
   $("settings-remember-cdp-url").value = settings.remember_cdp_url || "http://127.0.0.1:9222";
   $("settings-remember-browser-port").value = settings.remember_browser_port || 9222;
   $("settings-remember-browser-profile-dir").value = settings.remember_browser_profile_dir || "browser_profile";
   $("settings-browser-locale").value = settings.browser_locale || "ko-KR";
   $("settings-browser-accept-language").value = settings.browser_accept_language || "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7";
   $("settings-browser-timezone").value = settings.browser_timezone || "Asia/Seoul";
+  $("settings-confirm-before-proposal-send").checked = settings.confirm_before_proposal_send === true;
+  $("settings-remember-skip-proposal-send").checked = settings.remember_skip_proposal_send !== false;
   const prompts = settings.prompts || {};
   $("settings-match-system-prompt").value = prompts.match_system_prompt || "";
   $("settings-match-user-prompt").value = prompts.match_user_prompt || "";
   $("settings-clear-key").checked = false;
   $("llm-source").textContent = settings.api_key_set ? "OpenAI key saved" : "OpenAI fallback ready";
+  renderSaraminProviderControls();
 }
 
 async function openSettings() {
@@ -355,7 +488,6 @@ async function openSettings() {
   showSettingsTab("runtime");
   $("settings-modal").classList.add("open");
   $("settings-modal").setAttribute("aria-hidden", "false");
-  $("settings-api-key").focus();
 }
 
 function closeSettings() {
@@ -379,13 +511,15 @@ async function saveSettings() {
       max_delay_seconds: Number($("settings-max-delay").value || 0),
       usd_krw_rate: Number($("settings-usd-krw-rate").value || 1507.2),
       crawler_mode: $("settings-crawler-mode").value || "mock",
-      remember_url: $("settings-remember-url").value.trim() || "https://career.rememberapp.co.kr/",
+      remember_url: $("settings-remember-url").value.trim() || providerDefaultUrl(),
       remember_cdp_url: $("settings-remember-cdp-url").value.trim() || "http://127.0.0.1:9222",
       remember_browser_port: Number($("settings-remember-browser-port").value || 9222),
       remember_browser_profile_dir: $("settings-remember-browser-profile-dir").value.trim() || "browser_profile",
       browser_locale: $("settings-browser-locale").value.trim() || "ko-KR",
       browser_accept_language: $("settings-browser-accept-language").value.trim() || "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
       browser_timezone: $("settings-browser-timezone").value.trim() || "Asia/Seoul",
+      confirm_before_proposal_send: $("settings-confirm-before-proposal-send").checked,
+      remember_skip_proposal_send: $("settings-remember-skip-proposal-send").checked,
       prompts: {
         match_system_prompt: $("settings-match-system-prompt").value.trim(),
         match_user_prompt: $("settings-match-user-prompt").value.trim(),
@@ -479,12 +613,6 @@ async function pollRun(runId) {
   }
 }
 
-async function pauseRun() {
-  if (!state.run) return;
-  const run = await api(`/api/runs/${state.run.run_id}/pause`, { method: "POST", body: "{}" });
-  renderRun(run);
-}
-
 async function cancelRun() {
   if (!state.run) return;
   const run = await api(`/api/runs/${state.run.run_id}/cancel`, { method: "POST", body: "{}" });
@@ -504,6 +632,7 @@ async function autoSendReadyRun(run) {
   state.autoSendRunId = run.run_id;
   resetSendSelection();
   renderSendStage(run);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
   const ids = selectedSendIds();
   if (!ids.length) {
     const updated = await sendCandidates([]);
@@ -593,9 +722,10 @@ function renderRun(run) {
   $("stat-processed").textContent = stage === "crawling" ? crawled : processed;
   $("stat-passed").textContent = stats.passed || 0;
   $("stat-sent").textContent = stats.sent || 0;
+  $("stat-excluded").textContent = stats.excluded || 0;
+  $("stat-skipped").textContent = stats.skipped || 0;
   $("stat-failed").textContent = stats.failed || 0;
-  $("pause-btn").textContent = run.status === "paused" ? "재개" : "일시정지";
-  $("failure-watch").textContent = `${stats.failed || 0} / 3건`;
+  $("failure-watch").textContent = `${stats.consecutive_failed || 0} / 3건`;
   $("safety-status").textContent = run.status === "failed" ? "자동 정지" : "정상";
   $("safety-status").classList.toggle("success", run.status !== "failed");
   $("logs").innerHTML = (run.logs || []).map((line) => `<div>${escapeHtml(line)}</div>`).join("");
@@ -606,6 +736,20 @@ function renderRun(run) {
 function renderCurrent(run) {
   const candidate = run.current_candidate;
   const latest = [...(run.results || [])].reverse().find((result) => result.match);
+  if (!candidate && run.stage === "crawling") {
+    const provider = providerDisplayName();
+    const stats = run.stats || {};
+    const crawled = stats.crawled || 0;
+    const total = stats.total || run.config?.max_candidate_count || 0;
+    const name = run.current_crawl_name || "";
+    $("current-title").textContent = name ? `수집 중 · ${name}` : "후보자 수집 중";
+    $("current-id").textContent = crawled ? `${crawled} / ${total || "-"}` : "-";
+    $("current-candidate").className = "candidate-empty";
+    $("current-candidate").textContent = name
+      ? `${name} 후보자 정보를 ${provider}에서 수집하고 있습니다.`
+      : `${provider}에서 후보자 정보를 수집하고 있습니다.`;
+    return;
+  }
   if (!candidate && !latest) {
     $("current-title").textContent = "후보자 대기 중";
     $("current-id").textContent = "-";
@@ -665,30 +809,35 @@ function renderSendStage(run) {
   const threshold = currentSendThreshold();
   const rows = sortedSendRows(run, threshold);
   const eligible = rows.filter((row) => row.eligible);
+  const selectable = rows.filter((row) => isSelectableSendRow(row));
   const selected = rows.filter((row) => row.selected);
   const sent = rows.filter((row) => row.result.send_status === "sent");
+  const excluded = rows.filter((row) => row.result.send_status === "excluded");
+  const skipped = rows.filter((row) => row.result.send_status === "skipped");
   const failed = rows.filter((row) => row.result.send_status === "failed");
   const locked = run.status === "sending" || !run.config?.test_mode;
 
-  $("send-mode-badge").textContent = run.config?.test_mode ? "수동 발송" : "자동 발송";
+  $("send-mode-badge").textContent = run.config?.test_mode ? "확인 후 발송" : "자동 발송";
   $("send-stage-copy").textContent = run.config?.test_mode
-    ? "테스트모드입니다. 커트라인과 체크박스를 조정한 뒤 선택 발송하세요."
-    : "테스트모드가 아니므로 분석 완료 후 자동 발송이 시작됩니다.";
+    ? "설정에 따라 커트라인과 체크박스를 확인한 뒤 선택 발송하세요."
+    : "분석 완료 후 자동 발송이 시작됩니다.";
   $("send-summary-status").textContent = run.status === "sending" ? "발송 중" : statusText(run.status);
   $("send-total-count").textContent = rows.length;
   $("send-eligible-count").textContent = eligible.length;
   $("send-selected-count").textContent = selected.length;
-  $("send-done-count").textContent = `${sent.length}${failed.length ? ` / 실패 ${failed.length}` : ""}`;
+  $("send-done-count").textContent = `${sent.length}${excluded.length ? ` / 제외 ${excluded.length}` : ""}${skipped.length ? ` / 스킵 ${skipped.length}` : ""}${failed.length ? ` / 실패 ${failed.length}` : ""}`;
   $("send-action-copy").textContent = run.status === "sending"
     ? "발송을 진행 중입니다."
     : `${selected.length}명 발송 대상`;
   $("send-selected-btn").disabled = locked || selected.length === 0;
   $("send-threshold").disabled = run.status === "sending" || !run.config?.test_mode;
   $("send-table-note").textContent = `${rows.length}명 중 ${eligible.length}명 기준 통과`;
+  updateSendSelectAllControl(selectable, selected, locked);
 
   $("send-table").innerHTML = `
     <div class="send-row send-header">
       <span></span>
+      ${sendSortButton("crawlOrder", "순번")}
       ${sendSortButton("name", "후보자")}
       ${sendSortButton("company", "회사")}
       ${sendSortButton("role", "직무")}
@@ -704,14 +853,17 @@ function renderSendStage(run) {
 
 function sortedSendRows(run, threshold) {
   ensureSendSelection(run, threshold);
-  const rows = (run.results || []).map((result) => {
+  const rows = (run.results || []).map((result, index) => {
     const score = result.match?.total_score ?? -1;
     const eligible = score >= threshold;
     return {
       result,
+      crawlOrder: Number(result.candidate.crawl_order) || index + 1,
       score,
       eligible,
-      selected: Boolean(state.sendSelection[result.candidate.id]) && eligible && result.send_status !== "sent",
+      selected: Boolean(state.sendSelection[result.candidate.id])
+        && eligible
+        && !["sent", "skipped", "excluded"].includes(result.send_status),
     };
   });
   const { key, direction } = state.sendSort;
@@ -731,6 +883,7 @@ function sendSortValue(row, key) {
     company: c.company,
     role: c.role,
     experience: c.experience,
+    crawlOrder: row.crawlOrder,
     score: row.score,
     status: statusText(row.result.send_status),
   }[key] ?? "";
@@ -745,13 +898,14 @@ function sendSortButton(key, label) {
 function renderSendRow(row, locked) {
   const result = row.result;
   const candidate = result.candidate;
-  const disabled = locked || !row.eligible || result.send_status === "sent";
+  const disabled = locked || !isSelectableSendRow(row);
   const classes = ["send-row"];
   if (!row.eligible) classes.push("below-threshold");
   if (result.send_status === "sent") classes.push("sent-row");
   return `
     <div class="${classes.join(" ")}" data-candidate-id="${escapeHtml(candidate.id)}" data-score="${row.score}">
       <input type="checkbox" value="${escapeHtml(candidate.id)}" ${row.selected ? "checked" : ""} ${disabled ? "disabled" : ""}>
+      <span>${row.crawlOrder}</span>
       <b>${escapeHtml(candidate.name)}</b>
       <span>${escapeHtml(candidate.company)}</span>
       <span>${escapeHtml(candidate.role)}</span>
@@ -761,6 +915,10 @@ function renderSendRow(row, locked) {
       <span>${escapeHtml(result.match?.reason || result.send_reason || "")}</span>
     </div>
   `;
+}
+
+function isSelectableSendRow(row) {
+  return row.eligible && !["sent", "skipped", "excluded"].includes(row.result.send_status);
 }
 
 function updateSendThreshold(event) {
@@ -788,11 +946,33 @@ function handleSendTableChange(event) {
   renderSendStage(state.run);
 }
 
+function handleSendSelectAllChange(event) {
+  if (!state.run) return;
+  const checked = event.target.checked;
+  const threshold = currentSendThreshold();
+  for (const row of sortedSendRows(state.run, threshold)) {
+    if (isSelectableSendRow(row)) {
+      state.sendSelection[row.result.candidate.id] = checked;
+    }
+  }
+  renderSendStage(state.run);
+}
+
+function updateSendSelectAllControl(selectable, selected, locked) {
+  const checkbox = $("send-select-all");
+  const label = $("send-select-all-label");
+  const selectedSelectableCount = selected.filter((row) => isSelectableSendRow(row)).length;
+  checkbox.disabled = locked || selectable.length === 0;
+  checkbox.checked = selectable.length > 0 && selectedSelectableCount === selectable.length;
+  checkbox.indeterminate = selectedSelectableCount > 0 && selectedSelectableCount < selectable.length;
+  label.textContent = checkbox.checked ? "전체선택해제" : "전체선택";
+}
+
 function ensureSendSelection(run, threshold) {
   for (const result of run.results || []) {
     const id = result.candidate.id;
     const eligible = (result.match?.total_score ?? -1) >= threshold;
-    if (!eligible || result.send_status === "sent") {
+    if (!eligible || ["sent", "skipped", "excluded"].includes(result.send_status)) {
       state.sendSelection[id] = false;
     } else if (!Object.prototype.hasOwnProperty.call(state.sendSelection, id)) {
       state.sendSelection[id] = true;
@@ -831,16 +1011,19 @@ function currentSendThreshold() {
 function setSendControlsDisabled(disabled) {
   $("send-selected-btn").disabled = disabled;
   $("send-threshold").disabled = disabled;
+  $("send-select-all").disabled = disabled;
 }
 
 function renderResult(run) {
   const stats = run.stats || {};
   $("done-label").textContent = run.status === "failed" ? "이상 감지 · 자동 정지" : run.status === "cancelled" ? "사용자 중단" : "실행 완료 · 정상 종료";
-  $("result-title").textContent = `${stats.total || 0}명 분석 → ${stats.passed || 0}명 발송 기준 통과 → ${stats.sent || 0}명 발송`;
-  $("result-subtitle").textContent = run.stop_reason || "더미 리멤버 어댑터 실행 결과";
+  $("result-title").textContent = `${stats.total || 0}명 분석 → ${stats.selected || 0}명 발송 대상 → ${stats.sent || 0}명 발송`;
+  $("result-subtitle").textContent = run.stop_reason || `${providerDisplayName()} 실행 결과`;
   $("result-total").textContent = stats.total || 0;
   $("result-passed").textContent = stats.passed || 0;
   $("result-sent").textContent = stats.sent || 0;
+  $("result-excluded").textContent = stats.excluded || 0;
+  $("result-skipped").textContent = stats.skipped || 0;
   $("result-failed").textContent = stats.failed || 0;
   renderCostSummary(run.usage || {});
   const rows = (run.results || []).map((result) => `
@@ -894,12 +1077,12 @@ function statusText(status) {
   return {
     queued: "대기",
     running: "분석 중",
-    paused: "일시정지",
     ready_to_send: "발송 대기",
     sending: "발송 중",
     completed: "완료",
     cancelled: "중단",
     pending: "발송 대기",
+    excluded: "제외",
     skipped: "발송 스킵",
     sent: "발송 완료",
     failed: "발송 실패",
@@ -913,6 +1096,10 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value);
 }
 
 init();

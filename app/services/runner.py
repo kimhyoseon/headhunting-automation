@@ -6,13 +6,13 @@ from uuid import uuid4
 
 from app.models import (
     CandidateResult,
+    LLMUsage,
     RunCreateRequest,
     RunState,
     RunStats,
     RunStatus,
     SendSelectedRequest,
     SendStatus,
-    LLMUsage,
 )
 from app.services.llm import LLMService
 from app.services.privacy import redact_candidate_name
@@ -32,33 +32,33 @@ class RunManager:
         run_id = f"R-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:5]}"
         state = RunState(run_id=run_id, status=RunStatus.queued, config=config)
         adapter = remember_adapter or self.remember
+        if hasattr(adapter, "reset_cancel"):
+            adapter.reset_cancel()
         self.remember_adapters[run_id] = adapter
         self.runs[run_id] = state
-        task = asyncio.create_task(self._run(state, adapter))
-        self.tasks[run_id] = task
+        self.tasks[run_id] = asyncio.create_task(self._run(state, adapter))
         return state
 
     def get(self, run_id: str) -> RunState | None:
         return self.runs.get(run_id)
 
-    async def pause(self, run_id: str) -> RunState | None:
-        state = self.get(run_id)
-        if state and state.status == RunStatus.running:
-            state.status = RunStatus.paused
-            self._log(state, "사용자 요청으로 일시정지되었습니다.")
-            await self._publish_state(state)
-        elif state and state.status == RunStatus.paused:
-            state.status = RunStatus.running
-            self._log(state, "사용자 요청으로 실행을 재개했습니다.")
-            await self._publish_state(state)
-        return state
-
     async def cancel(self, run_id: str) -> RunState | None:
         state = self.get(run_id)
-        if state and state.status in {RunStatus.queued, RunStatus.running, RunStatus.paused, RunStatus.ready_to_send, RunStatus.sending}:
-            state.status = RunStatus.cancelled
-            state.stop_reason = "사용자 중단"
-            self._log(state, "사용자 요청으로 실행을 중단했습니다.")
+        cancellable = {
+            RunStatus.queued,
+            RunStatus.running,
+            RunStatus.ready_to_send,
+            RunStatus.sending,
+        }
+        if state and state.status in cancellable:
+            adapter = self.remember_adapters.get(run_id)
+            if adapter and hasattr(adapter, "request_cancel"):
+                adapter.request_cancel()
+            task = self.tasks.get(run_id)
+            if task and not task.done():
+                task.cancel()
+            self._mark_cancelled(state)
+            self._log(state, "Cancelled by user.")
             await self._publish_state(state)
         return state
 
@@ -68,66 +68,113 @@ class RunManager:
             return None
         if state.status not in {RunStatus.ready_to_send, RunStatus.completed}:
             return state
+
         legacy_test_hold = state.config.test_mode and state.status == RunStatus.completed and state.send_threshold is None
         if state.config.test_mode and state.status != RunStatus.ready_to_send and not legacy_test_hold:
-            self._log(state, "테스트모드 실행은 발송 대기 단계에서만 수동 발송할 수 있습니다.")
+            self._log(state, "Manual proposal sending is only available from the send-ready stage.")
             await self._publish_state(state)
             return state
-        state.status = RunStatus.sending
-        state.send_threshold = request.threshold
-        state.stop_reason = None
-        self._log(state, f"발송을 시작합니다. 기준 {request.threshold}점, 선택 {len(request.candidate_ids)}명.")
-        await self._publish_state(state)
 
         ids = set(request.candidate_ids)
+        state.stats.selected = sum(
+            1
+            for result in state.results
+            if result.candidate.id in ids
+            and result.match
+            and result.match.total_score >= request.threshold
+        )
+        state.status = RunStatus.sending
+        state.stage = "sending"
+        state.send_threshold = request.threshold
+        state.stop_reason = None
+        self._log(state, f"Sending started. threshold={request.threshold}, selected={state.stats.selected}")
+        await self._publish_state(state)
+
         consecutive_send_failures = 0
+        remember_adapter = self.remember_adapters.get(run_id, self.remember)
         for result in state.results:
+            if state.status == RunStatus.cancelled:
+                return state
             if result.send_status == SendStatus.sent:
                 continue
             if not result.match:
-                result.send_status = SendStatus.skipped
-                result.send_reason = "매칭 결과 없음"
+                result.send_status = SendStatus.excluded
+                result.send_reason = "No match result"
+                consecutive_send_failures = 0
                 continue
             if result.candidate.id not in ids:
-                result.send_status = SendStatus.skipped
-                result.send_reason = "선택 제외"
+                result.send_status = SendStatus.excluded
+                result.send_reason = "Not selected"
+                consecutive_send_failures = 0
                 continue
             if result.match.total_score < request.threshold:
-                result.send_status = SendStatus.skipped
-                result.send_reason = "발송 기준 미달"
+                result.send_status = SendStatus.excluded
+                result.send_reason = "Below send threshold"
+                consecutive_send_failures = 0
                 continue
-            remember_adapter = self.remember_adapters.get(run_id, self.remember)
-            ok, reason = await remember_adapter.send_proposal(result.candidate)
-            if ok:
-                if str(reason or "").startswith("DRY RUN"):
-                    result.send_status = SendStatus.skipped
-                else:
-                    result.send_status = SendStatus.sent
+
+            try:
+                send_status, reason = self._normalize_send_result(
+                    await remember_adapter.send_proposal(result.candidate)
+                )
+            except asyncio.CancelledError:
+                self._mark_cancelled(state)
+                await self._publish_state(state)
+                raise
+            if state.status == RunStatus.cancelled:
+                return state
+
+            if send_status == SendStatus.sent:
+                result.send_status = SendStatus.sent
                 result.send_reason = reason
                 consecutive_send_failures = 0
-                self._log(state, f"제안 발송 성공 - {result.candidate.id} ({result.candidate.name})")
+                self._log(state, f"Proposal sent - {result.candidate.id} ({result.candidate.name})")
+            elif send_status == SendStatus.skipped:
+                result.send_status = SendStatus.skipped
+                result.send_reason = reason
+                consecutive_send_failures = 0
+                self._log(state, f"Proposal skipped - {result.candidate.id}: {reason}")
             else:
                 result.send_status = SendStatus.failed
                 result.send_reason = reason
                 consecutive_send_failures += 1
-                self._log(state, f"제안 발송 실패 - {result.candidate.id}: {reason}")
+                self._log(state, f"Proposal failed - {result.candidate.id}: {reason}")
                 if consecutive_send_failures >= 3:
                     state.status = RunStatus.failed
-                    state.stop_reason = "연속 발송 실패 3건"
+                    state.stage = "failed"
+                    state.stop_reason = "Three consecutive proposal failures"
                     state.completed_at = datetime.now().isoformat(timespec="seconds")
                     self._refresh_stats(state, request.threshold)
-                    self._log(state, "이상 감지로 실행을 자동 정지했습니다.")
+                    self._log(state, "Stopped after three consecutive proposal failures.")
                     await self._publish_state(state)
                     return state
+
             self._refresh_stats(state, request.threshold)
             await self._publish_state(state)
+
         self._refresh_stats(state, request.threshold)
         state.status = RunStatus.completed
+        state.stage = "completed"
         state.completed_at = datetime.now().isoformat(timespec="seconds")
-        state.stop_reason = "발송 완료"
-        self._log(state, "선택 후보자 발송 처리가 완료되었습니다.")
+        state.stop_reason = "Proposal sending completed"
+        self._log(state, "Selected proposal sending completed.")
         await self._publish_state(state)
         return state
+
+    def _normalize_send_result(self, send_result) -> tuple[SendStatus, str]:
+        raw_status = send_result
+        reason = ""
+        if isinstance(send_result, tuple):
+            raw_status = send_result[0] if len(send_result) >= 1 else False
+            reason = str(send_result[1] if len(send_result) >= 2 else "")
+
+        if isinstance(raw_status, SendStatus):
+            return raw_status, reason
+        if raw_status is True:
+            return SendStatus.sent, reason
+        if raw_status is None:
+            return SendStatus.skipped, reason
+        return SendStatus.failed, reason
 
     async def subscribe(self, run_id: str) -> asyncio.Queue[dict]:
         queue: asyncio.Queue[dict] = asyncio.Queue()
@@ -146,13 +193,18 @@ class RunManager:
         state.started_at = datetime.now().isoformat(timespec="seconds")
         if state.config.max_candidate_count is not None:
             state.stats.total = state.config.max_candidate_count
-        adapter_name = "브라우저 리멤버 어댑터" if remember_adapter is not self.remember else "더미 리멤버 어댑터"
-        self._log(state, f"{adapter_name}로 검색을 시작합니다.")
+        adapter_name = str(getattr(remember_adapter, "display_name", "") or "candidate browser adapter")
+        provider_name = str(getattr(remember_adapter, "provider_name", "") or "Provider")
+        self._log(state, f"Search started with {adapter_name}.")
         await self._publish_state(state)
 
         previous_progress_callback = getattr(remember_adapter, "progress_callback", None)
+        last_logged_crawl_count = 0
 
         async def on_crawl_progress(progress: dict) -> None:
+            nonlocal last_logged_crawl_count
+            if state.status == RunStatus.cancelled:
+                raise asyncio.CancelledError()
             state.stage = "crawling"
             requested = progress.get("requestedLimit")
             collected = int(progress.get("crawledCount") or progress.get("totalCollected") or 0)
@@ -165,6 +217,16 @@ class RunManager:
             if state.stats.total:
                 collected = min(collected, state.stats.total)
             state.stats.crawled = collected
+            current_name = str(progress.get("currentName") or "").strip()
+            if current_name:
+                state.current_crawl_name = current_name
+            if collected > last_logged_crawl_count:
+                last_logged_crawl_count = collected
+                label = f"{collected}/{state.stats.total or '?'}"
+                if current_name:
+                    self._log(state, f"Crawled {label} - {current_name}")
+                else:
+                    self._log(state, f"Crawled {label}")
             await self._publish_state(state)
 
         if hasattr(remember_adapter, "progress_callback"):
@@ -172,75 +234,92 @@ class RunManager:
 
         try:
             candidates = await remember_adapter.search(state.config.max_candidate_count)
+        except asyncio.CancelledError:
+            self._mark_cancelled(state)
+            await self._publish_state(state)
+            raise
         except Exception as exc:
             state.status = RunStatus.failed
             state.stage = "failed"
             state.stop_reason = str(exc)
             state.completed_at = datetime.now().isoformat(timespec="seconds")
-            self._log(state, f"리멤버 검색 실패 - {exc}")
+            self._log(state, f"{provider_name} search failed - {exc}")
             await self._publish_state(state)
             return
         finally:
             if hasattr(remember_adapter, "progress_callback"):
                 remember_adapter.progress_callback = previous_progress_callback
-        state.stats = RunStats(total=len(candidates))
-        state.stats.crawled = len(candidates)
+
+        if state.status == RunStatus.cancelled:
+            return
+
+        state.current_crawl_name = None
+        state.stats = RunStats(total=len(candidates), crawled=len(candidates))
         state.stage = "matching"
-        process_label = "무제한" if state.config.max_candidate_count is None else f"{state.config.max_candidate_count}명"
-        self._log(state, f"검색 결과 {len(candidates)}명을 불러왔습니다. 처리 상한 {process_label}.")
+        process_label = "unlimited" if state.config.max_candidate_count is None else f"{state.config.max_candidate_count}"
+        self._log(state, f"Loaded {len(candidates)} candidates. requested={process_label}.")
+
         crawl_result = getattr(remember_adapter, "last_crawl_result", None)
         if isinstance(crawl_result, dict):
             pages = crawl_result.get("pages") or []
             if pages:
-                page_summary = ", ".join(
-                    f"{page.get('pageNumber')}p {page.get('collected')}명"
-                    for page in pages[:10]
-                )
-                self._log(state, f"리멤버 페이지 수집 내역: {page_summary}")
+                page_summary = ", ".join(f"{page.get('pageNumber')}p {page.get('collected')}" for page in pages[:10])
+                self._log(state, f"{provider_name} page crawl summary: {page_summary}")
         await self._publish_state(state)
 
         for index, candidate in enumerate(candidates, start=1):
             if state.status == RunStatus.cancelled:
                 break
-            while state.status == RunStatus.paused:
-                await asyncio.sleep(0.5)
+            if state.status == RunStatus.cancelled:
+                break
 
             state.current_candidate = candidate
-            self._log(state, f"후보자 {index}/{len(candidates)} 상세 페이지 열람 - {candidate.name} ({candidate.company})")
+            self._log(state, f"Matching {index}/{len(candidates)} - {candidate.name} ({candidate.company})")
             await self._publish_state(state)
 
-            opened = await remember_adapter.open_candidate(candidate)
-            api_resume_text = self._candidate_text_for_api(opened)
-            match = await self.llm.match_candidate(
-                state.config.jd_text,
-                api_resume_text,
-                state.config.threshold,
-                debug_log=state.config.test_mode,
-                run_id=state.run_id,
-                candidate_id=opened.id,
-            )
+            try:
+                opened = await remember_adapter.open_candidate(candidate)
+                api_resume_text = self._candidate_text_for_api(opened)
+                match = await self.llm.match_candidate(
+                    state.config.jd_text,
+                    api_resume_text,
+                    state.config.threshold,
+                    debug_log=state.config.test_mode,
+                    run_id=state.run_id,
+                    candidate_id=opened.id,
+                )
+            except asyncio.CancelledError:
+                self._mark_cancelled(state)
+                await self._publish_state(state)
+                raise
+
             state.usage = self._combine_usage(state.usage, match.usage)
-            result = CandidateResult(
-                candidate=opened,
-                match=match,
-                send_status=SendStatus.pending,
-            )
+            result = CandidateResult(candidate=opened, match=match, send_status=SendStatus.pending)
             state.results.append(result)
             state.stats.processed += 1
             if match.passed:
                 state.stats.passed += 1
-                self._log(state, f"매칭 통과 - {candidate.id} {match.total_score}점")
+                self._log(state, f"Match passed - {candidate.id} {match.total_score}")
             else:
-                self._log(state, f"매칭 탈락 - {candidate.id} {match.total_score}점")
+                self._log(state, f"Match failed - {candidate.id} {match.total_score}")
             await self._publish_state(state)
 
         if state.status != RunStatus.cancelled:
             state.status = RunStatus.ready_to_send
             state.stage = "ready_to_send"
             state.current_candidate = None
-            state.stop_reason = "분석 완료 - 발송 대기"
-            self._log(state, "모든 후보자 분석이 완료되었습니다. 발송 단계로 이동합니다.")
+            state.current_crawl_name = None
+            state.stop_reason = "Analysis completed - ready to send"
+            self._log(state, "All candidates analyzed. Moving to send stage.")
             await self._publish_state(state)
+
+    def _mark_cancelled(self, state: RunState) -> None:
+        state.status = RunStatus.cancelled
+        state.stage = "cancelled"
+        state.current_candidate = None
+        state.current_crawl_name = None
+        state.stop_reason = "User cancelled"
+        state.completed_at = datetime.now().isoformat(timespec="seconds")
 
     def _candidate_text_for_api(self, candidate) -> str:
         return redact_candidate_name(
@@ -277,7 +356,19 @@ class RunManager:
             1 for result in state.results if result.match and result.match.total_score >= active_threshold
         )
         state.stats.sent = sum(1 for result in state.results if result.send_status == SendStatus.sent)
+        state.stats.excluded = sum(1 for result in state.results if result.send_status == SendStatus.excluded)
+        state.stats.skipped = sum(1 for result in state.results if result.send_status == SendStatus.skipped)
         state.stats.failed = sum(1 for result in state.results if result.send_status == SendStatus.failed)
+        state.stats.consecutive_failed = self._consecutive_send_failures(state.results)
+
+    def _consecutive_send_failures(self, results: list[CandidateResult]) -> int:
+        count = 0
+        for result in results:
+            if result.send_status == SendStatus.failed:
+                count += 1
+            elif result.send_status in {SendStatus.sent, SendStatus.skipped, SendStatus.excluded}:
+                count = 0
+        return count
 
     def _log(self, state: RunState, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")

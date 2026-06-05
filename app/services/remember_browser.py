@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import hashlib
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ class RememberBrowserConfig:
     locale: str = "ko-KR"
     accept_language: str = "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
     timezone: str = "Asia/Seoul"
+    skip_proposal_send: bool = True
 
 
 class BrowserRememberAdapter:
@@ -27,10 +29,110 @@ class BrowserRememberAdapter:
     """
 
     def __init__(self, config: RememberBrowserConfig) -> None:
+        self.display_name = "browser Remember adapter"
+        self.provider_name = "Remember"
         self.config = config
-        self.results_page_size = 50
+        self.results_page_size = 150
         self.last_crawl_result: dict[str, Any] | None = None
         self.progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def reset_cancel(self) -> None:
+        self._cancel_requested = False
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_requested:
+            raise asyncio.CancelledError()
+
+    async def inspect_search_result_count(self) -> dict[str, Any]:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            raise RuntimeError("Playwright is not installed. Run: pip install playwright") from exc
+
+        playwright = await async_playwright().start()
+        try:
+            browser = await playwright.chromium.connect_over_cdp(self.config.cdp_url)
+            await self._apply_context_overrides(browser.contexts)
+            pages = [page for context in browser.contexts for page in context.pages]
+            page = self._select_remember_page(pages)
+            if not page:
+                return {
+                    "ok": False,
+                    "count": None,
+                    "reason": "리멤버 탭을 찾지 못했습니다.",
+                }
+
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except PlaywrightTimeoutError:
+                pass
+
+            await self._apply_page_overrides(page)
+            return await page.evaluate(
+                """() => {
+                    const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                    const visible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0
+                            && rect.height > 0
+                            && rect.bottom > 0
+                            && rect.right > 0
+                            && rect.top < (window.innerHeight || document.documentElement.clientHeight)
+                            && rect.left < (window.innerWidth || document.documentElement.clientWidth)
+                            && style.display !== "none"
+                            && style.visibility !== "hidden";
+                    };
+                    const parseCount = (text) => {
+                        const match = clean(text).match(/([0-9,]+)\\s*명\\s*검색됨/);
+                        if (!match) return null;
+                        return Number(match[1].replace(/,/g, ""));
+                    };
+                    const candidates = [
+                        ...Array.from(document.querySelectorAll('[data-target-id="StickyHeader"]')),
+                        ...Array.from(document.querySelectorAll("main *, section *, header *, div, span"))
+                            .filter((el) => clean(el.innerText || el.textContent || "").includes("검색됨")),
+                    ];
+                    const seen = new Set();
+                    for (const el of candidates) {
+                        if (seen.has(el)) continue;
+                        seen.add(el);
+                        if (!visible(el)) continue;
+                        const text = clean(el.innerText || el.textContent || "");
+                        const count = parseCount(text);
+                        if (count !== null && Number.isFinite(count)) {
+                            return {
+                                ok: count > 0,
+                                count,
+                                text,
+                                reason: count > 0
+                                    ? ""
+                                    : "리멤버 검색 결과가 0명입니다. 검색 조건을 확인한 뒤 다시 시작하세요.",
+                                url: location.href,
+                            };
+                        }
+                    }
+                    const visibleSamples = Array.from(document.querySelectorAll("main *, section *, header *, div, span"))
+                        .filter(visible)
+                        .map((el) => clean(el.innerText || el.textContent || ""))
+                        .filter((text) => text.includes("검색") || text.includes("검색됨"))
+                        .slice(0, 20);
+                    return {
+                        ok: false,
+                        count: null,
+                        reason: "리멤버 검색 결과 수를 확인하지 못했습니다. 인재 검색 결과 화면에서 다시 시작하세요.",
+                        samples: visibleSamples,
+                        url: location.href,
+                    };
+                }"""
+            )
+        finally:
+            await playwright.stop()
 
     async def inspect_active_tab(self) -> dict[str, Any]:
         """Probe the user-controlled Remember tab through Chrome DevTools Protocol.
@@ -136,9 +238,11 @@ class BrowserRememberAdapter:
         except ImportError as exc:
             raise RuntimeError("Playwright is not installed. Run: pip install playwright") from exc
 
+        self._raise_if_cancelled()
         crawl_limit = limit if limit and limit > 0 else None
         playwright = await async_playwright().start()
         try:
+            self._raise_if_cancelled()
             browser = await playwright.chromium.connect_over_cdp(self.config.cdp_url)
             await self._apply_context_overrides(browser.contexts)
             pages = [page for context in browser.contexts for page in context.pages]
@@ -153,7 +257,9 @@ class BrowserRememberAdapter:
 
             await page.bring_to_front()
             await self._apply_page_overrides(page)
+            self._raise_if_cancelled()
             crawl_result = await self._crawl_candidates_across_pages(page, limit=crawl_limit)
+            self._raise_if_cancelled()
             self.last_crawl_result = crawl_result
             candidates = [
                 self._candidate_from_crawl(item)
@@ -169,7 +275,7 @@ class BrowserRememberAdapter:
     async def open_candidate(self, candidate: Candidate) -> Candidate:
         return candidate
 
-    async def send_proposal(self, candidate: Candidate) -> tuple[bool, str]:
+    async def send_proposal(self, candidate: Candidate) -> tuple[bool | None, str]:
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
             from playwright.async_api import async_playwright
@@ -200,7 +306,19 @@ class BrowserRememberAdapter:
 
             opened = await self._open_candidate_card_for_sending(page, candidate)
             if not opened.get("ok"):
-                return False, str(opened.get("reason") or "candidate card was not found")
+                reason = str(opened.get("reason") or "candidate card was not found")
+                diagnostics = []
+                if opened.get("cardCount") is not None:
+                    diagnostics.append(f"cardCount={opened.get('cardCount')}")
+                if opened.get("cardKey"):
+                    diagnostics.append(f"cardKey={opened.get('cardKey')}")
+                if opened.get("cardIndex") is not None:
+                    diagnostics.append(f"cardIndex={opened.get('cardIndex')}")
+                if opened.get("searchAttempts") is not None:
+                    diagnostics.append(f"searchAttempts={opened.get('searchAttempts')}")
+                if diagnostics:
+                    reason = f"{reason} ({', '.join(diagnostics)})"
+                return False, reason
 
             for _ in range(3):
                 await page.wait_for_timeout(1200)
@@ -211,15 +329,41 @@ class BrowserRememberAdapter:
             else:
                 return False, "candidate detail layer did not match the selected candidate"
 
-            proposal_button = await self._find_proposal_button_in_detail_layer(page)
-            if not proposal_button.get("ok"):
-                return False, str(proposal_button.get("reason") or "proposal button was not found")
+            proposal_modal = await self._open_proposal_modal_from_detail_layer(page)
+            if not proposal_modal.get("ok"):
+                return False, str(proposal_modal.get("reason") or "1차 제안 보내기 버튼 클릭 후 제안 작성 레이어를 확인하지 못했습니다.")
 
-            return True, "DRY RUN: 제안 보내기 버튼 확인 완료(실제 클릭은 주석 처리됨)"
+            modal_action = await self._click_proposal_modal_action(
+                page,
+                skip_send=self.config.skip_proposal_send,
+            )
+            if not modal_action.get("ok"):
+                return False, f"1차 제안 보내기 버튼 클릭 후 제안 작성 레이어를 확인하지 못했습니다: {modal_action.get('reason') or 'proposal modal action failed'}"
+
+            if self.config.skip_proposal_send:
+                return None, "제안 보내지않기 설정으로 제안 작성 레이어에서 닫기 버튼을 클릭했습니다."
+            return True, "제안 보내기 완료"
         finally:
             await playwright.stop()
 
     async def _open_candidate_card_for_sending(self, page, candidate: Candidate) -> dict[str, Any]:
+        await self._reset_candidate_list_to_top(page)
+        last_result: dict[str, Any] | None = None
+        for attempt in range(12):
+            self._raise_if_cancelled()
+            result = await self._try_open_candidate_card_for_sending(page, candidate)
+            if result.get("ok"):
+                return {**result, "searchAttempt": attempt + 1}
+            last_result = result
+            await self._scroll_candidate_list_for_card_search(page)
+        return {
+            **(last_result or {}),
+            "ok": False,
+            "reason": (last_result or {}).get("reason") or "candidate card was not found on the Remember results page",
+            "searchAttempts": 12,
+        }
+
+    async def _try_open_candidate_card_for_sending(self, page, candidate: Candidate) -> dict[str, Any]:
         return await page.evaluate(
             """(candidate) => {
                 const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
@@ -314,7 +458,105 @@ class BrowserRememberAdapter:
             candidate.model_dump(mode="json"),
         )
 
-    async def _find_proposal_button_in_detail_layer(self, page) -> dict[str, Any]:
+    async def _scroll_candidate_list_for_card_search(self, page) -> None:
+        await page.evaluate(
+            """() => {
+                const scrollByPage = (el) => {
+                    if (!el) return false;
+                    const amount = Math.max(240, Math.floor((el.clientHeight || window.innerHeight || 800) * 0.75));
+                    if (typeof el.scrollBy === "function") {
+                        el.scrollBy({top: amount, left: 0, behavior: "instant"});
+                    } else {
+                        el.scrollTop = (el.scrollTop || 0) + amount;
+                    }
+                    return true;
+                };
+                const cards = Array.from(document.querySelectorAll('[class*="ResultContainer"]'));
+                const scrollers = new Set();
+                const addScrollableAncestors = (el) => {
+                    let current = el;
+                    while (current && current !== document.body && current !== document.documentElement) {
+                        const style = getComputedStyle(current);
+                        const canScroll = current.scrollHeight > current.clientHeight + 20;
+                        const overflowY = `${style.overflowY} ${style.overflow}`;
+                        if (canScroll && /(auto|scroll|overlay)/.test(overflowY)) {
+                            scrollers.add(current);
+                        }
+                        current = current.parentElement;
+                    }
+                };
+                cards.slice(0, 3).forEach(addScrollableAncestors);
+                const layoutScroller = document.querySelector("#layout-contents-scrollable");
+                if (layoutScroller) scrollers.add(layoutScroller);
+                if (!scrollers.size) {
+                    scrollByPage(document.scrollingElement || document.documentElement);
+                    window.scrollBy({top: Math.max(240, Math.floor((window.innerHeight || 800) * 0.75)), left: 0, behavior: "instant"});
+                    return {scrollerCount: 0};
+                }
+                scrollers.forEach(scrollByPage);
+                return {scrollerCount: scrollers.size};
+            }"""
+        )
+        await page.wait_for_timeout(450)
+
+    async def _keep_session_active(self, page, step: int) -> None:
+        if step % 5:
+            return
+        try:
+            await page.mouse.move(24 + (step % 7) * 9, 24 + (step % 5) * 7, steps=2)
+            await page.keyboard.press("Shift")
+        except Exception:
+            pass
+
+    async def _open_proposal_modal_from_detail_layer(self, page) -> dict[str, Any]:
+        last_button_result: dict[str, Any] | None = None
+        last_modal_result: dict[str, Any] | None = None
+        for attempt in range(3):
+            existing_modal = await self._read_proposal_modal_state(page)
+            if existing_modal.get("ok"):
+                return {**existing_modal, "attempt": attempt, "openedBy": "already-open"}
+
+            button_result = await self._find_proposal_button_in_detail_layer(page)
+            last_button_result = button_result
+            if not button_result.get("ok"):
+                return {
+                    "ok": False,
+                    "reason": f"오른쪽 후보자 상세 레이어의 1차 제안 보내기 버튼 클릭 실패: {button_result.get('reason') or 'proposal button was not found'}",
+                    "buttonResult": button_result,
+                }
+
+            modal_result = await self._wait_for_proposal_modal(page)
+            last_modal_result = modal_result
+            if modal_result.get("ok"):
+                return {
+                    **modal_result,
+                    "attempt": attempt + 1,
+                    "openedBy": str(button_result.get("source") or "proposal-button"),
+                }
+
+            await page.wait_for_timeout(500)
+
+        return {
+            "ok": False,
+            "reason": f"1차 제안 보내기 버튼 클릭 후 제안 작성 레이어를 확인하지 못했습니다: {last_modal_result.get('reason') if last_modal_result else 'proposal modal was not found'}",
+            "buttonResult": last_button_result,
+            "modalResult": last_modal_result,
+        }
+
+    async def _wait_for_proposal_modal(self, page) -> dict[str, Any]:
+        last_result: dict[str, Any] | None = None
+        for _ in range(8):
+            result = await self._read_proposal_modal_state(page)
+            last_result = result
+            if result.get("ok"):
+                return result
+            await page.wait_for_timeout(350)
+        return last_result or {
+            "ok": False,
+            "reason": "proposal modal was not found",
+        }
+
+    async def _read_proposal_modal_state(self, page) -> dict[str, Any]:
         return await page.evaluate(
             """() => {
                 const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
@@ -330,65 +572,207 @@ class BrowserRememberAdapter:
                         && style.display !== "none"
                         && style.visibility !== "hidden";
                 };
-                const panels = Array.from(document.querySelectorAll('[data-gnb-open]'))
+                const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [data-state="open"]'))
                     .filter(visible)
-                    .map((el) => {
-                        const rect = el.getBoundingClientRect();
-                        const text = clean(el.innerText || el.textContent || "");
-                        const className = String(el.className || "");
-                        const nestedGnbOpenCount = Array.from(el.querySelectorAll('[data-gnb-open]'))
-                            .filter((child) => child !== el).length;
-                        const isPageShell = el.id === "layout-contents-scrollable"
-                            || nestedGnbOpenCount > 0
-                            || text.length > 12000
-                            || className.includes("LayoutContainer")
-                            || className.includes("GnbWrapper")
-                            || className.includes("styles__Wrapper")
-                            || className.includes("ContentsWrapper");
-                        return {el, text, x: rect.x, textLength: text.length, isPageShell};
-                    })
-                    .filter((item) => !item.isPageShell && item.textLength > 40)
-                    .sort((a, b) => b.textLength - a.textLength || b.x - a.x);
-                const panel = panels[0]?.el;
-                if (!panel) {
-                    return {ok: false, reason: "data-gnb-open detail layer not found"};
-                }
-                const buttons = Array.from(panel.querySelectorAll("button"))
-                    .filter(visible)
-                    .map((button) => ({
-                        button,
-                        text: clean(button.innerText || button.textContent || button.getAttribute("aria-label") || ""),
-                        disabled: Boolean(button.disabled) || button.getAttribute("aria-disabled") === "true",
-                        busy: button.getAttribute("aria-busy") === "true",
+                    .map((el) => ({
+                        text: clean(el.innerText || el.textContent || ""),
+                        buttonTexts: Array.from(el.querySelectorAll("button"))
+                            .filter(visible)
+                            .map((button) => clean(button.innerText || button.textContent || button.getAttribute("aria-label") || "")),
                     }))
-                    .filter((item) => item.text === "제안 보내기");
-                const target = buttons.find((item) => !item.disabled && !item.busy);
-                if (!target) {
+                    .filter((item) => item.text.includes("제안 작성"))
+                    .sort((a, b) => a.text.length - b.text.length);
+                const dialog = dialogs[0];
+                if (!dialog) {
                     return {
                         ok: false,
-                        reason: "enabled proposal button was not found in the detail layer",
-                        buttonTexts: buttons.map((item) => item.text),
+                        reason: "proposal modal was not found",
                     };
                 }
-
-                // 실제 발송 연결 시 이 줄만 활성화한다.
-                // target.button.click();
                 return {
                     ok: true,
-                    text: target.text,
-                    dryRun: true,
-                    buttonCount: buttons.length,
+                    text: dialog.text.slice(0, 240),
+                    buttonTexts: dialog.buttonTexts,
                 };
             }"""
         )
 
+    async def _find_proposal_button_in_detail_layer(self, page) -> dict[str, Any]:
+        result = await page.evaluate(
+            """() => {
+                const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                const normalizeLabel = (value) => clean(value).replace(/\\s+/g, "");
+                const proposalLabels = new Set(["제안보내기", "제안하기"]);
+                const isProposalLabel = (value) => proposalLabels.has(normalizeLabel(value));
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.right > 0
+                        && rect.top < (window.innerHeight || document.documentElement.clientHeight)
+                        && rect.left < (window.innerWidth || document.documentElement.clientWidth)
+                        && style.display !== "none"
+                        && style.visibility !== "hidden";
+                };
+                const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+                const buttonItems = Array.from(document.querySelectorAll("button, [role='button']"))
+                    .filter(visible)
+                    .map((button) => {
+                        const rect = button.getBoundingClientRect();
+                        const text = clean(button.innerText || button.textContent || button.getAttribute("aria-label") || "");
+                        const dialog = button.closest('[role="dialog"]');
+                        const dialogText = dialog ? clean(dialog.innerText || dialog.textContent || "") : "";
+                        const gnbLayer = button.closest('[data-gnb-open]');
+                        const rightSide = rect.left >= viewportWidth * 0.45 || (rect.left + rect.width / 2) >= viewportWidth * 0.55;
+                        return {
+                            button,
+                            text,
+                            normalizedText: normalizeLabel(text),
+                            disabled: Boolean(button.disabled) || button.getAttribute("aria-disabled") === "true",
+                            busy: button.getAttribute("aria-busy") === "true",
+                            inProposalModal: dialogText.includes("제안 작성"),
+                            inGnbLayer: Boolean(gnbLayer),
+                            rightSide,
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                            centerX: rect.left + rect.width / 2,
+                            centerY: rect.top + rect.height / 2,
+                        };
+                    })
+                    .filter((item) => isProposalLabel(item.text) && !item.inProposalModal);
+                const rightLayerButtons = buttonItems
+                    .filter((item) => item.rightSide)
+                    .sort((a, b) => Number(b.inGnbLayer) - Number(a.inGnbLayer) || b.x - a.x || b.y - a.y);
+                const target = rightLayerButtons.find((item) => !item.disabled && !item.busy);
+                if (!target) {
+                    return {
+                        ok: false,
+                        reason: rightLayerButtons.length
+                            ? "오른쪽 후보자 상세 레이어의 1차 제안 보내기 버튼이 비활성화 상태입니다."
+                            : "오른쪽 후보자 상세 레이어에서 1차 제안 보내기 버튼을 찾지 못했습니다.",
+                        proposalButtons: buttonItems.map((item) => ({
+                            text: item.text,
+                            rightSide: item.rightSide,
+                            disabled: item.disabled,
+                            busy: item.busy,
+                            x: Math.round(item.x),
+                            y: Math.round(item.y),
+                            width: Math.round(item.width),
+                            height: Math.round(item.height),
+                        })).slice(0, 20),
+                    };
+                }
+
+                target.button.scrollIntoView({block: "center", inline: "nearest"});
+                const rect = target.button.getBoundingClientRect();
+                return {
+                    ok: true,
+                    text: target.text,
+                    clickX: rect.left + rect.width / 2,
+                    clickY: rect.top + rect.height / 2,
+                    buttonCount: rightLayerButtons.length,
+                    source: target.inGnbLayer ? "right-gnb-detail-layer" : "right-visible-button",
+                };
+            }"""
+        )
+        if not result.get("ok"):
+            return result
+        await page.mouse.click(float(result["clickX"]), float(result["clickY"]))
+        result["clicked"] = True
+        return result
+
+    async def _click_proposal_modal_action(self, page, skip_send: bool) -> dict[str, Any]:
+        target_text = "닫기" if skip_send else "보내기"
+        last_result: dict[str, Any] | None = None
+        for _ in range(12):
+            result = await page.evaluate(
+                """(targetText) => {
+                    const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                    const visible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0
+                            && rect.height > 0
+                            && rect.bottom > 0
+                            && rect.right > 0
+                            && rect.top < (window.innerHeight || document.documentElement.clientHeight)
+                            && rect.left < (window.innerWidth || document.documentElement.clientWidth)
+                            && style.display !== "none"
+                            && style.visibility !== "hidden";
+                    };
+                    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [data-state="open"]'))
+                        .filter(visible)
+                        .map((el) => ({
+                            el,
+                            text: clean(el.innerText || el.textContent || ""),
+                            buttonTexts: Array.from(el.querySelectorAll("button"))
+                                .filter(visible)
+                                .map((button) => clean(button.innerText || button.textContent || button.getAttribute("aria-label") || "")),
+                        }))
+                        .filter((item) => item.text.includes("제안 작성") && item.buttonTexts.some((text) => text === targetText))
+                        .sort((a, b) => a.text.length - b.text.length);
+                    const dialog = dialogs[0]?.el;
+                    if (!dialog) {
+                        return {
+                            ok: false,
+                            reason: "proposal modal was not found",
+                            targetText,
+                        };
+                    }
+                    const buttons = Array.from(dialog.querySelectorAll("button"))
+                        .filter(visible)
+                        .map((button) => ({
+                            button,
+                            text: clean(button.innerText || button.textContent || button.getAttribute("aria-label") || ""),
+                            disabled: Boolean(button.disabled) || button.getAttribute("aria-disabled") === "true",
+                            busy: button.getAttribute("aria-busy") === "true",
+                        }))
+                        .filter((item) => item.text === targetText);
+                    const target = buttons.find((item) => !item.disabled && !item.busy);
+                    if (!target) {
+                        return {
+                            ok: false,
+                            reason: "proposal modal action button was not ready",
+                            targetText,
+                            buttonTexts: buttons.map((item) => item.text),
+                        };
+                    }
+                    target.button.scrollIntoView({block: "center", inline: "nearest"});
+                    const rect = target.button.getBoundingClientRect();
+                    return {
+                        ok: true,
+                        text: target.text,
+                        clickX: rect.left + rect.width / 2,
+                        clickY: rect.top + rect.height / 2,
+                    };
+                }""",
+                target_text,
+            )
+            last_result = result
+            if result.get("ok"):
+                await page.wait_for_timeout(500)
+                await page.mouse.click(float(result["clickX"]), float(result["clickY"]))
+                result["clicked"] = True
+                return result
+            await page.wait_for_timeout(500)
+        return last_result or {
+            "ok": False,
+            "reason": "proposal modal action timed out",
+            "targetText": target_text,
+        }
+
     async def _crawl_candidates_across_pages(self, page, limit: int | None) -> dict[str, Any]:
         collected: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
+        seen_page_signatures: set[tuple[str, ...]] = set()
         page_results: list[dict[str, Any]] = []
         base_results_url = self._base_results_url(page.url)
-        page_number = self._page_number_from_url(base_results_url) or 1
-        max_pages = 100 if limit is None else max(1, (limit + 49) // 50 + 3)
+        page_number = 1
+        max_pages = 100 if limit is None else max(1, (limit + self.results_page_size - 1) // self.results_page_size + 3)
         pages_visited = 0
         await self._emit_progress(
             stage="crawling",
@@ -399,10 +783,12 @@ class BrowserRememberAdapter:
         )
 
         while limit is None or len(collected) < limit:
+            self._raise_if_cancelled()
             if pages_visited >= max_pages:
                 break
             results_page_url = self._results_page_url(base_results_url, page_number)
             await self._go_to_results_page(page, base_results_url, page_number)
+            self._raise_if_cancelled()
             remaining = 1000 if limit is None else max(limit - len(collected), 0)
             if remaining <= 0:
                 break
@@ -418,9 +804,27 @@ class BrowserRememberAdapter:
                 requested_limit=limit,
                 target_success_count=remaining,
             )
+            self._raise_if_cancelled()
             page_candidates = crawl_result.get("candidates", [])
+            page_signature = self._crawl_page_signature(page_candidates)
+            if page_signature and page_signature in seen_page_signatures:
+                page_results.append(
+                    {
+                        "pageNumber": page_number,
+                        "targetUrl": results_page_url,
+                        "url": page.url,
+                        "attempted": len(page_candidates),
+                        "collected": 0,
+                        "totalCollected": len(collected),
+                        "repeatedPage": True,
+                    }
+                )
+                break
+            if page_signature:
+                seen_page_signatures.add(page_signature)
             new_count = 0
             for item in page_candidates:
+                self._raise_if_cancelled()
                 if not item.get("success") or not item.get("detailText"):
                     continue
                 key = self._crawl_identity(item)
@@ -471,8 +875,10 @@ class BrowserRememberAdapter:
         }
 
     async def _emit_progress(self, **payload: Any) -> None:
+        self._raise_if_cancelled()
         if self.progress_callback:
             await self.progress_callback(payload)
+        self._raise_if_cancelled()
 
     async def _crawl_current_screen_candidates(
         self,
@@ -485,8 +891,10 @@ class BrowserRememberAdapter:
         requested_limit: int | None = None,
         target_success_count: int | None = None,
     ) -> dict[str, Any]:
+        self._raise_if_cancelled()
         if start_from_top:
             await self._reset_candidate_list_to_top(page)
+            self._raise_if_cancelled()
         seen_detail_fingerprints: set[str] = set()
         screen_success_count = 0
 
@@ -551,6 +959,7 @@ class BrowserRememberAdapter:
 
         candidates: list[dict[str, Any]] = []
         for order, ref in enumerate(candidate_refs, start=1):
+            self._raise_if_cancelled()
             before_detail = await page.evaluate(
                 """() => {
                     const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
@@ -719,6 +1128,7 @@ class BrowserRememberAdapter:
                 }""",
                 ref,
             )
+            self._raise_if_cancelled()
             if not clicked.get("ok"):
                 candidates.append(
                     {
@@ -734,6 +1144,7 @@ class BrowserRememberAdapter:
                 )
                 continue
 
+            await self._keep_session_active(page, order)
             await page.wait_for_timeout(1200)
             detail_ready = True
             try:
@@ -1018,6 +1429,7 @@ class BrowserRememberAdapter:
                     "allowExisting": bool(clicked.get("alreadyOpen")),
                 },
             )
+            self._raise_if_cancelled()
             raw_detail_text = str(detail.get("detailText", "") or "")
             cleaned_detail_text = self._clean_profile_text(raw_detail_text)
             cleaned_success = bool(cleaned_detail_text and cleaned_detail_text != "-")
@@ -1254,14 +1666,20 @@ class BrowserRememberAdapter:
         params = parse_qsl(parsed.query, keep_blank_values=True)
         next_params: list[tuple[str, str]] = []
         page_set = False
+        per_set = False
         for key, value in params:
             if key == "page":
                 next_params.append((key, str(page_number)))
                 page_set = True
+            elif key == "per":
+                next_params.append((key, "150"))
+                per_set = True
             else:
                 next_params.append((key, value))
         if not page_set:
             next_params.append(("page", str(page_number)))
+        if not per_set:
+            next_params.append(("per", "150"))
         return urlunparse(parsed._replace(query=urlencode(next_params, doseq=True)))
 
     @staticmethod
@@ -1273,26 +1691,35 @@ class BrowserRememberAdapter:
             return None
         return value if value > 0 else None
 
+    @classmethod
+    def _crawl_page_signature(cls, items: list[dict[str, Any]]) -> tuple[str, ...]:
+        keys = [
+            cls._crawl_identity(item)
+            for item in items
+            if item.get("success") and (item.get("detailText") or item.get("summaryText"))
+        ]
+        return tuple(key for key in keys if key)
+
     @staticmethod
     def _crawl_identity(item: dict[str, Any]) -> str:
+        profile_id = str(item.get("profileId") or "")
+        if not profile_id:
+            profile_id = BrowserRememberAdapter._profile_id_from_url(str(item.get("url") or "")) or ""
+        if profile_id:
+            return f"profile:{profile_id}"
+        profile_card_id = str(item.get("cardKey") or "")
+        if profile_card_id:
+            return f"profile-card:{profile_card_id}"
         detail_fingerprint = str(item.get("detailFingerprint") or "")
         if not detail_fingerprint:
             detail_fingerprint = BrowserRememberAdapter._detail_fingerprint(str(item.get("detailText") or ""))
         if detail_fingerprint:
             return f"detail:{detail_fingerprint}"
-        profile_card_id = str(item.get("cardKey") or "")
-        if profile_card_id:
-            return f"profile-card:{profile_card_id}"
-        text = str(item.get("detailText") or item.get("summaryText") or "").strip()
+        text = str(item.get("detailText") or item.get("summaryText") or "")
         compact = " ".join(text.split())
         if compact:
-            return "text:" + compact[:1000]
-        url = str(item.get("url") or "")
-        query = dict(parse_qsl(urlparse(url).query, keep_blank_values=True))
-        profile_id = query.get("profileId")
-        if profile_id:
-            return f"profile:{profile_id}"
-        return f"candidate:{item.get('pageNumber', '')}:{item.get('cardIndex', '')}:{item.get('name', '')}"
+            return "text:" + hashlib.sha256(compact[:1000].encode("utf-8")).hexdigest()[:16]
+        return f"candidate:{item.get('cardIndex', '')}:{item.get('name', '')}"
 
     @staticmethod
     def _detail_fingerprint(text: str) -> str:
@@ -1562,6 +1989,7 @@ class BrowserRememberAdapter:
             remember_detail_url=detail_url or None,
             remember_profile_id=profile_id or None,
             remember_profile_card_id=profile_card_id or None,
+            crawl_order=order or None,
             remember_card_index=int(item.get("cardIndex") or 0) if item.get("cardIndex") is not None else None,
             remember_card_text=str(item.get("cardText") or item.get("summaryText") or "")[:1200] or None,
         )

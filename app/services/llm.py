@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -144,18 +145,8 @@ class LLMService:
         threshold: int,
         source: str,
     ) -> MatchResult:
-        jd = jd_text.lower()
-        resume = resume_text.lower()
-        words = {
-            word.strip(".,;:()[]{}<>\"'").lower()
-            for word in jd.replace("/", " ").replace("-", " ").split()
-            if len(word.strip(".,;:()[]{}<>\"'")) >= 2
-        }
-        matched = sorted(word for word in words if word in resume)
-        total = min(95, 55 + len(matched) * 4)
-        reason = self._reason_for(total, threshold)
-        if matched:
-            reason = "핵심 키워드 일치"
+        total = random.randint(80, 100)
+        reason = "API 키 없음 - 데모 랜덤 점수" if source == "demo" else self._reason_for(total, threshold)
         return MatchResult(
             total_score=total,
             passed=total >= threshold,

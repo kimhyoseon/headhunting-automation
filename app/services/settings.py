@@ -10,6 +10,7 @@ from app.models import AppSettingsResponse, AppSettingsUpdate, PromptSettings
 
 
 DEFAULTS = {
+    "HEADHUNTING_PROVIDER": "remember",
     "OPENAI_API_KEY": "",
     "OPENAI_MODEL": "gpt-5.4-mini",
     "APP_HOST": "127.0.0.1",
@@ -25,6 +26,8 @@ DEFAULTS = {
     "BROWSER_LOCALE": "ko-KR",
     "BROWSER_ACCEPT_LANGUAGE": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "BROWSER_TIMEZONE": "Asia/Seoul",
+    "CONFIRM_BEFORE_PROPOSAL_SEND": "false",
+    "REMEMBER_SKIP_PROPOSAL_SEND": "true",
 }
 
 
@@ -39,6 +42,7 @@ class SettingsStore:
         values = self._values()
         key = str(values.get("OPENAI_API_KEY", "")).strip()
         return AppSettingsResponse(
+            provider=str(values.get("HEADHUNTING_PROVIDER") or DEFAULTS["HEADHUNTING_PROVIDER"]).strip() or "remember",
             api_key_set=bool(key),
             api_key_preview=self._preview_key(key),
             openai_model=str(values.get("OPENAI_MODEL") or DEFAULTS["OPENAI_MODEL"]).strip(),
@@ -55,6 +59,8 @@ class SettingsStore:
             browser_locale=str(values.get("BROWSER_LOCALE") or DEFAULTS["BROWSER_LOCALE"]).strip(),
             browser_accept_language=str(values.get("BROWSER_ACCEPT_LANGUAGE") or DEFAULTS["BROWSER_ACCEPT_LANGUAGE"]).strip(),
             browser_timezone=str(values.get("BROWSER_TIMEZONE") or DEFAULTS["BROWSER_TIMEZONE"]).strip(),
+            confirm_before_proposal_send=self._bool_value(values.get("CONFIRM_BEFORE_PROPOSAL_SEND"), False),
+            remember_skip_proposal_send=self._bool_value(values.get("REMEMBER_SKIP_PROPOSAL_SEND"), True),
             prompts=self._load_prompts(),
         )
 
@@ -84,6 +90,8 @@ class SettingsStore:
             "BROWSER_LOCALE": update.browser_locale.strip() or DEFAULTS["BROWSER_LOCALE"],
             "BROWSER_ACCEPT_LANGUAGE": update.browser_accept_language.strip() or DEFAULTS["BROWSER_ACCEPT_LANGUAGE"],
             "BROWSER_TIMEZONE": update.browser_timezone.strip() or DEFAULTS["BROWSER_TIMEZONE"],
+            "CONFIRM_BEFORE_PROPOSAL_SEND": "true" if update.confirm_before_proposal_send else "false",
+            "REMEMBER_SKIP_PROPOSAL_SEND": "true" if update.remember_skip_proposal_send else "false",
         }
         for key, value in to_save.items():
             set_key(str(self.env_path), key, value, quote_mode="never")
@@ -156,6 +164,15 @@ class SettingsStore:
             return parsed if parsed >= 0 else default
         except ValueError:
             return default
+
+    @staticmethod
+    def _bool_value(value: str | None, default: bool) -> bool:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
 
     @staticmethod
     def _crawler_mode(value: str | None) -> str:

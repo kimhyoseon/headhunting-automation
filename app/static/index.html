@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>헤드헌팅 자동화 MVP</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260527-02">
+  <link rel="stylesheet" href="/static/styles.css?v=20260605-01">
 </head>
 <body>
   <div class="app">
@@ -15,7 +15,7 @@
         <span class="brand-tag">MVP · demo crawler</span>
       </div>
       <div class="topbar-right">
-        <span class="pill ok"><span class="dot"></span>브라우저 리멤버 세션 연결</span>
+        <span class="pill ok"><span class="dot"></span><span id="provider-session-copy">브라우저 세션 연결</span></span>
         <span class="pill violet" id="llm-source">OpenAI fallback ready</span>
         <button class="btn outline small" id="settings-open-btn">설정</button>
       </div>
@@ -33,7 +33,7 @@
       <section class="screen active" id="screen-1">
         <div class="page-head">
           <h1>JD를 붙여넣고 분석을 시작하세요.</h1>
-          <p>JD와 현재 리멤버 창의 후보자 정보를 비교해 매칭 분석을 진행합니다.</p>
+          <p id="provider-page-copy">JD와 현재 채용 사이트 창의 후보자 정보를 비교해 매칭 분석을 진행합니다.</p>
         </div>
         <div class="grid two">
           <div class="stack">
@@ -70,19 +70,6 @@
               <div class="hint">메시지 발송 수는 제한하지 않습니다. 수동 입력칸에는 숫자 또는 '무한대'를 입력할 수 있고, 저장된 값은 다음 실행에도 자동 적용됩니다.</div>
             </article>
             <article class="card">
-              <div class="mode-row">
-                <div>
-                  <h2>테스트모드</h2>
-                  <p id="test-mode-copy">OFF - 통과자에게 자동 발송 시뮬레이션</p>
-                </div>
-                <label class="switch">
-                  <input id="test-mode" type="checkbox">
-                  <span></span>
-                </label>
-              </div>
-              <div class="hint">ON이면 매칭 통과자를 체크박스 리스트에 모았다가 선택 발송합니다. 초기 검수 운용을 가정한 흐름입니다.</div>
-            </article>
-            <article class="card">
               <div class="card-head"><h2>안전장치</h2><span class="badge success">3/3 활성</span></div>
               <ul class="safety">
                 <li><b>30~90초</b><span>실제 연동 시 후보자 간 랜덤 지연</span></li>
@@ -92,10 +79,25 @@
             </article>
           </aside>
         </div>
+        <div class="saramin-position-panel" id="saramin-position-card" hidden>
+          <div class="saramin-position-top">
+            <div class="saramin-position-title">
+              <span class="saramin-kicker">Saramin</span>
+              <h2>사람인 제안 포지션</h2>
+              <p id="saramin-position-status">선택된 포지션 없음</p>
+            </div>
+            <div class="saramin-position-actions">
+              <span class="saramin-status-chip" id="saramin-position-badge">미선택</span>
+              <button class="btn dark" id="saramin-position-btn" type="button">제안 포지션 선택</button>
+            </div>
+          </div>
+          <div class="saramin-selected-position" id="saramin-position-label">선택된 포지션 없음</div>
+          <div class="saramin-position-options" id="saramin-position-options" hidden></div>
+        </div>
         <div class="crawl-test-panel" id="crawl-test-panel" hidden>
           <div class="card-head">
             <div>
-              <h2>리멤버 탭 HTML 테스트</h2>
+              <h2 id="crawl-test-title">채용 사이트 탭 HTML 테스트</h2>
               <p id="crawl-test-status">아직 실행하지 않았습니다.</p>
             </div>
             <span class="badge blue" id="crawl-test-badge">대기</span>
@@ -105,7 +107,6 @@
         <div class="action-bar">
           <span>후보자 이력서 원문은 저장하지 않고 메모리에서만 처리합니다.</span>
           <button class="btn ghost" id="reset-input">초기화</button>
-          <button class="btn outline" id="crawl-test-btn">크롤링 테스트</button>
           <button class="btn primary" id="generate-btn">분석 시작</button>
         </div>
       </section>
@@ -115,8 +116,7 @@
           <div class="progress-top">
             <div><strong id="progress-count">0 / 0</strong><span> 처리 중</span></div>
             <div class="progress"><span id="progress-fill"></span></div>
-            <span class="pill blue" id="mode-pill">테스트모드 OFF</span>
-            <button class="btn outline" id="pause-btn">일시정지</button>
+            <span class="pill blue" id="mode-pill">확인 후 발송 OFF</span>
             <button class="btn danger" id="cancel-btn">중단</button>
           </div>
           <div class="stats">
@@ -124,6 +124,8 @@
             <div><strong id="stat-processed">0</strong><span>이력서 확인</span></div>
             <div><strong id="stat-passed">0</strong><span>매칭 통과</span></div>
             <div><strong id="stat-sent">0</strong><span>발송 완료</span></div>
+            <div><strong id="stat-excluded">0</strong><span>제외</span></div>
+            <div><strong id="stat-skipped">0</strong><span>스킵</span></div>
             <div><strong id="stat-failed">0</strong><span>실패</span></div>
           </div>
         </div>
@@ -187,6 +189,10 @@
                 <h2>2단계 분석 결과</h2>
                 <span id="send-table-note">전체 후보자</span>
               </div>
+              <label class="send-bulk-row">
+                <input id="send-select-all" type="checkbox">
+                <span id="send-select-all-label">전체선택</span>
+              </label>
               <div id="send-table" class="send-table"></div>
             </article>
           </div>
@@ -200,13 +206,9 @@
                 <div><strong id="send-done-count">0</strong><span>발송 완료</span></div>
               </div>
               <div class="send-box send-stage-actions">
-                <span id="send-action-copy">대상을 확인하세요.</span>
                 <button class="btn primary" id="send-selected-btn">선택 발송</button>
+                <span id="send-action-copy">대상을 확인하세요.</span>
               </div>
-            </article>
-            <article class="info-card muted">
-              <b>현재 발송 동작</b>
-              <p>리멤버에서 후보자 재오픈, 이력서 클릭, 발송 버튼 클릭은 아직 더미 처리입니다. 이 화면은 실제 자동화 어댑터를 붙일 발송 단계 구조입니다.</p>
             </article>
           </aside>
         </div>
@@ -217,8 +219,8 @@
           <div class="check">✓</div>
           <div>
             <span class="done-label" id="done-label">실행 완료</span>
-            <h1 id="result-title">0명 검색 → 0명 매칭 통과 → 0명 발송</h1>
-            <p id="result-subtitle">더미 리멤버 어댑터 실행 결과</p>
+            <h1 id="result-title">0명 분석 → 0명 발송 대상 → 0명 발송</h1>
+            <p id="result-subtitle">실행 결과</p>
           </div>
           <div class="result-actions">
             <button class="btn outline" id="download-summary-btn">상세 리포트 받기</button>
@@ -229,6 +231,8 @@
           <div><strong id="result-total">0</strong><span>분석 후보자</span></div>
           <div><strong id="result-passed">0</strong><span>기준 통과</span></div>
           <div><strong id="result-sent">0</strong><span>발송 완료</span></div>
+          <div><strong id="result-excluded">0</strong><span>제외</span></div>
+          <div><strong id="result-skipped">0</strong><span>스킵</span></div>
           <div><strong id="result-failed">0</strong><span>발송 실패</span></div>
           <div><strong id="result-cost-krw">₩0</strong><span>API 호출비용</span></div>
           <div><strong id="result-token-total">0</strong><span>토큰 사용량</span></div>
@@ -265,6 +269,27 @@
       </div>
       <div class="settings-panel active" id="settings-panel-runtime">
         <div class="settings-grid">
+          <div class="settings-section-title">테스트 옵션</div>
+          <div class="settings-toggle">
+            <div>
+              <span>확인 후 제안서 발송</span>
+              <small>켜면 분석 통과자를 3단계에서 확인한 뒤 선택 발송합니다.</small>
+            </div>
+            <label class="switch">
+              <input id="settings-confirm-before-proposal-send" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="settings-toggle">
+            <div>
+              <span>제안 보내지않기</span>
+              <small>켜면 제안 작성 레이어를 열고 실제 발송 대신 닫기 버튼을 누릅니다.</small>
+            </div>
+            <label class="switch">
+              <input id="settings-remember-skip-proposal-send" type="checkbox">
+              <span></span>
+            </label>
+          </div>
           <label class="field">
             <span>OpenAI API 키</span>
             <input id="settings-api-key" type="password" autocomplete="off" placeholder="새 키를 입력하면 교체됩니다.">
@@ -323,12 +348,12 @@
               <option value="mock">목 데이터</option>
               <option value="browser">사용자 브라우저 연결</option>
             </select>
-            <small>현재는 목 데이터가 기본값입니다. 실제 리멤버 접근 PC에서 브라우저 연결 모드로 전환합니다.</small>
+            <small id="settings-crawler-mode-copy">현재는 목 데이터가 기본값입니다. 실제 채용 사이트 접근 PC에서 브라우저 연결 모드로 전환합니다.</small>
           </label>
           <label class="field">
-            <span>리멤버 시작 URL</span>
+            <span id="settings-provider-url-label">채용 사이트 시작 URL</span>
             <input id="settings-remember-url" type="url" autocomplete="off" placeholder="https://career.rememberapp.co.kr/">
-            <small>전용 브라우저를 열 때 앱 탭과 함께 열릴 리멤버 탭 주소입니다.</small>
+            <small id="settings-provider-url-copy">전용 브라우저를 열 때 앱 탭과 함께 열릴 채용 사이트 탭 주소입니다.</small>
           </label>
           <label class="field">
             <span>CDP 연결 주소</span>
@@ -353,7 +378,7 @@
           <label class="field">
             <span>Accept-Language 헤더</span>
             <input id="settings-browser-accept-language" type="text" autocomplete="off" placeholder="ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7">
-            <small>리멤버 탭의 이후 요청에 적용됩니다. 기존 로드 요청에는 적용되지 않습니다.</small>
+            <small id="settings-provider-language-copy">채용 사이트 탭의 이후 요청에 적용됩니다. 기존 로드 요청에는 적용되지 않습니다.</small>
           </label>
           <label class="field">
             <span>브라우저 타임존</span>
@@ -364,7 +389,7 @@
         </div>
         <div class="browser-note">
           <b>실행 구조</b>
-          <p><code>run_app.bat</code>을 실행하면 서버가 켜지고, 같은 Chrome/Edge 창 안에 앱 탭과 리멤버 탭이 함께 열립니다. 사용자는 리멤버 탭에서 로그인과 검색 조건 설정을 마친 뒤 앱 탭에서 시작 버튼을 누르는 흐름으로 진행합니다.</p>
+          <p id="settings-provider-run-copy"><code>run_app.bat</code>을 실행하면 서버가 켜지고, 같은 Chrome/Edge 창 안에 앱 탭과 채용 사이트 탭이 함께 열립니다. 사용자는 채용 사이트 탭에서 로그인과 검색 조건 설정을 마친 뒤 앱 탭에서 시작 버튼을 누르는 흐름으로 진행합니다.</p>
         </div>
       </div>
       <div class="settings-panel" id="settings-panel-prompts">
@@ -387,6 +412,6 @@
       </div>
     </section>
   </div>
-  <script src="/static/app.js?v=20260528-04"></script>
+  <script src="/static/app.js?v=20260605-02"></script>
 </body>
 </html>

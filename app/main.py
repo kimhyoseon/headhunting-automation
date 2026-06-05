@@ -5,6 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -14,15 +15,16 @@ from app.services.privacy import redact_candidate_name
 from app.services.remember import MockRememberAdapter
 from app.services.remember_browser import BrowserRememberAdapter, RememberBrowserConfig
 from app.services.runner import RunManager
+from app.services.saramin_browser import BrowserSaraminAdapter, SaraminBrowserConfig
 from app.services.settings import SettingsStore
-
-load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 STATIC_DIR = BASE_DIR / "static"
-ENV_PATH = ROOT_DIR / ".env"
+ENV_PATH = Path(os.getenv("HEADHUNTING_ENV_PATH", str(ROOT_DIR / ".env"))).expanduser()
 PROMPTS_PATH = ROOT_DIR / "config" / "prompts.json"
+
+load_dotenv(dotenv_path=ENV_PATH)
 
 app = FastAPI(title="헤드헌팅 후보자 제안 자동화 MVP")
 settings_store = SettingsStore(ENV_PATH, PROMPTS_PATH)
@@ -36,6 +38,12 @@ llm.configure(
 )
 remember = MockRememberAdapter()
 run_manager = RunManager(llm, remember)
+selected_saramin_offer_position: dict[str, str] | None = None
+
+
+class SaraminOfferPositionSelection(BaseModel):
+    id: str = ""
+    label: str = ""
 
 
 @app.middleware("http")
@@ -59,6 +67,46 @@ async def get_settings():
     return settings_store.load()
 
 
+def _provider() -> str:
+    return str(os.getenv("HEADHUNTING_PROVIDER") or "remember").strip().lower() or "remember"
+
+
+def _saramin_adapter(settings, offer_position: dict[str, str] | None = None) -> BrowserSaraminAdapter:
+    return BrowserSaraminAdapter(
+        SaraminBrowserConfig(
+            cdp_url=settings.remember_cdp_url,
+            saramin_url=settings.remember_url,
+            locale=settings.browser_locale,
+            accept_language=settings.browser_accept_language,
+            timezone=settings.browser_timezone,
+            skip_proposal_send=settings.remember_skip_proposal_send,
+            offer_position=offer_position,
+        )
+    )
+
+
+@app.get("/api/saramin/offer-positions")
+async def get_saramin_offer_positions():
+    if _provider() != "saramin":
+        raise HTTPException(status_code=404, detail="Saramin provider is not active.")
+    settings = settings_store.load()
+    try:
+        return await _saramin_adapter(settings).inspect_offer_positions()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/saramin/offer-position")
+async def save_saramin_offer_position(request: SaraminOfferPositionSelection):
+    global selected_saramin_offer_position
+    position_id = request.id.strip()
+    label = request.label.strip()
+    if not position_id and not label:
+        raise HTTPException(status_code=400, detail="Saramin offer position is required.")
+    selected_saramin_offer_position = {"id": position_id, "label": label}
+    return {"ok": True, "position": selected_saramin_offer_position}
+
+
 @app.post("/api/settings")
 async def save_settings(request: AppSettingsUpdate):
     if request.max_delay_seconds < request.min_delay_seconds:
@@ -79,8 +127,23 @@ async def create_run(request: RunCreateRequest):
     if not request.jd_text.strip():
         raise HTTPException(status_code=400, detail="JD 본문을 입력하세요.")
     settings = settings_store.load()
+    request = request.model_copy(update={"test_mode": settings.confirm_before_proposal_send})
     remember_adapter = None
     if settings.crawler_mode == "browser":
+        if _provider() == "saramin":
+            if not selected_saramin_offer_position:
+                raise HTTPException(status_code=400, detail="Saramin offer position is not selected.")
+            remember_adapter = _saramin_adapter(settings, selected_saramin_offer_position)
+            try:
+                search_count = await remember_adapter.inspect_search_result_count()
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Saramin search result check failed: {exc}") from exc
+            if not search_count.get("ok"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=str(search_count.get("reason") or "Saramin search candidates were not found."),
+                )
+            return run_manager.create_run(request, remember_adapter=remember_adapter)
         remember_adapter = BrowserRememberAdapter(
             RememberBrowserConfig(
                 cdp_url=settings.remember_cdp_url,
@@ -88,8 +151,26 @@ async def create_run(request: RunCreateRequest):
                 locale=settings.browser_locale,
                 accept_language=settings.browser_accept_language,
                 timezone=settings.browser_timezone,
+                skip_proposal_send=settings.remember_skip_proposal_send,
             )
         )
+        try:
+            search_count = await remember_adapter.inspect_search_result_count()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"리멤버 검색 결과 수 확인에 실패했습니다: {exc}",
+            ) from exc
+        if not search_count.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail=str(search_count.get("reason") or "리멤버 검색 결과 수를 확인하지 못했습니다."),
+            )
+        available_count = search_count.get("count")
+        if type(available_count) is int:
+            requested_count = request.max_candidate_count
+            effective_count = available_count if requested_count is None else min(requested_count, available_count)
+            request = request.model_copy(update={"max_candidate_count": max(effective_count, 1)})
     return run_manager.create_run(request, remember_adapter=remember_adapter)
 
 
@@ -103,6 +184,7 @@ async def remember_html_test():
             locale=settings.browser_locale,
             accept_language=settings.browser_accept_language,
             timezone=settings.browser_timezone,
+            skip_proposal_send=settings.remember_skip_proposal_send,
         )
     )
     try:
@@ -131,14 +213,6 @@ async def download_run_summary(run_id: str):
         media_type="text/markdown; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-
-@app.post("/api/runs/{run_id}/pause")
-async def pause_run(run_id: str):
-    state = await run_manager.pause(run_id)
-    if not state:
-        raise HTTPException(status_code=404, detail="실행을 찾을 수 없습니다.")
-    return state
 
 
 @app.post("/api/runs/{run_id}/cancel")
@@ -207,7 +281,7 @@ def _build_run_summary(state) -> str:
         f"- 시작: {state.started_at or '-'}",
         f"- 완료: {state.completed_at or '-'}",
         f"- 중단/완료 사유: {state.stop_reason or '-'}",
-        f"- 테스트 모드: {'ON' if config.test_mode else 'OFF'}",
+        f"- 확인 후 제안서 발송: {'ON' if config.test_mode else 'OFF'}",
         f"- 통과 기준 점수: {config.threshold}점",
         f"- 발송 기준 점수: {active_threshold}점",
         f"- 처리 상한: {max_candidates}",
@@ -217,7 +291,10 @@ def _build_run_summary(state) -> str:
         f"- 검색 결과: {stats.total}명",
         f"- 분석 완료: {stats.processed}명",
         f"- 발송 기준 통과: {stats.passed}명",
+        f"- 발송 대상 선택: {stats.selected}명",
         f"- 발송 완료: {stats.sent}명",
+        f"- 발송 제외: {stats.excluded}명",
+        f"- 발송 스킵: {stats.skipped}명",
         f"- 발송 실패: {stats.failed}명",
         f"- JD 글자 수: {len(config.jd_text):,}자",
         "",
@@ -283,9 +360,9 @@ def _build_run_summary(state) -> str:
                 "| 항목 | 내용 |",
                 "| --- | --- |",
                 f"| 후보자 ID | {_md_cell(candidate.id)} |",
-                f"| 리멤버 페이지 | {_md_cell(getattr(candidate, 'remember_page_number', None) or '-')} |",
-                f"| 리멤버 카드 ID | {_md_cell(getattr(candidate, 'remember_profile_card_id', None) or '-')} |",
-                f"| 리멤버 카드 순번 | {_md_cell(getattr(candidate, 'remember_card_index', None) if getattr(candidate, 'remember_card_index', None) is not None else '-')} |",
+                f"| 원본 페이지 | {_md_cell(getattr(candidate, 'remember_page_number', None) or '-')} |",
+                f"| 원본 카드 ID | {_md_cell(getattr(candidate, 'remember_profile_card_id', None) or '-')} |",
+                f"| 원본 카드 순번 | {_md_cell(getattr(candidate, 'remember_card_index', None) if getattr(candidate, 'remember_card_index', None) is not None else '-')} |",
                 f"| 이름 | {_md_cell(candidate.name)} |",
                 f"| 회사 | {_md_cell(candidate.company)} |",
                 f"| 직무 | {_md_cell(candidate.role)} |",
